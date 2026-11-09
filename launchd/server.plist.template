@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 結果ページの配信と質問への回答を行うサーバー。bin/install.sh が __XXX__ を埋めて ~/Library/LaunchAgents に置く -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__.server</string>
+
+  <!-- bash を通さず python3 を直接起動する（理由は review.plist.template を参照） -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/lib/server.py</string>
+    <string>--launchd</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <!-- 常駐させる。ログイン時に起動し、落ちたら立ち上げ直す -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- 起動に失敗し続けたときに、立ち上げ直しを繰り返しすぎないようにする -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/server.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/server.launchd.err.log</string>
+</dict>
+</plist>

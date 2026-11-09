@@ -1,0 +1,68 @@
+{
+  "type": "object",
+  "properties": {
+    "summary_points": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "何を変えたか・挙動への影響を 1〜3 項目。各 1 行"
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "description": "マージしたときに問題が起きる可能性と影響の大きさ"
+    },
+    "risk_reason": {
+      "type": "string",
+      "description": "risk をそう判断した理由（1 文）"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "level": { "type": "string", "enum": ["must", "q", "imo", "nit"] },
+          "category": { "type": "string", "description": "観点のファイルにある記号（例: A-1）。当てはまらなければ空文字" },
+          "file": { "type": "string", "description": "リポジトリのルートからの相対パス" },
+          "line": { "type": ["integer", "null"], "description": "head 側の行番号。特定できなければ null" },
+          "title": { "type": "string", "description": "指摘の要点（1 行）" },
+          "reason": { "type": "string", "description": "なぜ問題か（1〜2 文）" },
+          "suggestion": { "type": "string", "description": "提案形式か質問形式の 1 文" }
+        },
+        "required": ["level", "category", "file", "line", "title", "reason", "suggestion"],
+        "additionalProperties": false
+      }
+    },
+    "my_comments_status": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["not_fixed", "partial", "unclear", "replied", "fixed"] },
+          "file": { "type": "string", "description": "指摘した箇所のファイル。PR 全体へのコメントなら空文字" },
+          "line": { "type": ["integer", "null"], "description": "指摘した行（今の head 側）。分からなければ null" },
+          "comment": { "type": "string", "description": "自分の指摘の要約（1 行）" },
+          "note": { "type": "string", "description": "どう対応されたか（1 文）" }
+        },
+        "required": ["status", "file", "line", "comment", "note"],
+        "additionalProperties": false
+      },
+      "description": "pr/my_review_comments.json にある自分の指摘ごとの対応状況。ファイルが無ければ空配列"
+    },
+    "check_points": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "人間が確認すべき点。0〜3 件、各 1 行"
+    },
+    "good_points": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "良い実装。0〜2 件、各 1 行"
+    },
+    "changes_since_previous": {
+      "type": ["string", "null"],
+      "description": "前回のレビューからの変化（1〜2 文）。前回が無ければ null"
+    }
+  },
+  "required": ["summary_points", "risk", "risk_reason", "findings", "my_comments_status", "check_points", "good_points", "changes_since_previous"],
+  "additionalProperties": false
+}

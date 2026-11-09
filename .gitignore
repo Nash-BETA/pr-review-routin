@@ -1,0 +1,15 @@
+# 実行データ。非公開のコード・PR の中身・レビュー結果・質問の会話を含むので、絶対にコミットしない
+/data/
+/out/
+
+# 設定。組織や個人に固有の値を含むので、見本の env.example 以外はコミットしない
+/config/*
+!/config/env.example
+
+# 以前の版で作業ディレクトリをリポジトリ内に置いていたときの名残（今は ~/Library/Caches/pr-review-routine）
+/work/
+/qa/
+
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR 自動レビュー</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --fg: #1d2330;
+    --muted: #616b7c;
+    --border: #dfe3ea;
+    --accent: #2f6fde;
+    --must: #c62828;
+    --must-bg: #fdecec;
+    --q: #1f5fbf;
+    --q-bg: #e8f0fd;
+    --imo: #a8650a;
+    --imo-bg: #fdf3e2;
+    --nit: #5b6475;
+    --nit-bg: #eef0f4;
+    --ok: #2e7d32;
+    --ok-bg: #e8f5e9;
+    --warn-bg: #fff8e1;
+    --code-bg: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c;
+      --card: #1c2027;
+      --fg: #e4e7ec;
+      --muted: #9aa3b2;
+      --border: #2e343e;
+      --accent: #7aa7ff;
+      --must: #ff8a80;
+      --must-bg: #3a1f1f;
+      --q: #8ab4ff;
+      --q-bg: #1d2a42;
+      --imo: #ffc46b;
+      --imo-bg: #3a2e1a;
+      --nit: #b4bccb;
+      --nit-bg: #2a2f38;
+      --ok: #8fd694;
+      --ok-bg: #1e3321;
+      --warn-bg: #3a331a;
+      --code-bg: #262c36;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .88em;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    word-break: break-all;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .banner { margin: 12px 0; padding: 10px 12px; border-radius: 8px; background: var(--must-bg); color: var(--must); white-space: pre-wrap; }
+  .counters { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+  .counter { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; min-width: 110px; }
+  .counter b { display: block; font-size: 20px; }
+  .counter span { color: var(--muted); font-size: 12px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 8px 0 16px; }
+  .toolbar label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+  select { font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin-bottom: 14px; }
+  .card.confirmed { opacity: .55; }
+  .card-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+  .title { font-size: 15px; font-weight: 600; word-break: break-word; line-height: 1.5; }
+  .title .num { color: var(--muted); font-weight: 400; margin-right: 6px; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+  .badge { display: inline-block; font-size: 11px; line-height: 1.6; padding: 0 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
+  .badge.via { background: var(--code-bg); }
+  .st-reviewed { background: var(--ok-bg); color: var(--ok); border-color: transparent; }
+  .st-pending, .st-pending_update, .st-pending_rerequest, .st-retrying { background: var(--warn-bg); border-color: transparent; }
+  .badge.rereq { background: var(--q-bg); color: var(--q); border-color: transparent; }
+  .ms { display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.6; padding: 0 6px; border-radius: 4px; white-space: nowrap; }
+  .ms-not_fixed { background: var(--must-bg); color: var(--must); }
+  .ms-partial { background: var(--imo-bg); color: var(--imo); }
+  .ms-unclear { background: var(--nit-bg); color: var(--nit); }
+  .ms-replied { background: var(--q-bg); color: var(--q); }
+  .ms-fixed { background: var(--ok-bg); color: var(--ok); }
+  .mycomment { padding: 6px 0 6px 12px; border-left: 3px solid var(--border); margin-bottom: 6px; }
+  .mycomment .mhead { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .mycomment .loc { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .mycomment .note { color: var(--muted); }
+  .mycomment .arrow { color: var(--accent); font-weight: 700; }
+  .st-failed { background: var(--must-bg); color: var(--must); border-color: transparent; }
+  .st-inactive { color: var(--muted); }
+  .risk-high { background: var(--must-bg); color: var(--must); border-color: transparent; }
+  .risk-medium { background: var(--imo-bg); color: var(--imo); border-color: transparent; }
+  .risk-low { background: var(--ok-bg); color: var(--ok); border-color: transparent; }
+  .confirm { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; font-size: 12px; color: var(--muted); cursor: pointer; }
+
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .counts { display: inline-flex; gap: 4px; margin-left: 8px; vertical-align: middle; }
+  .lv { display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.6; padding: 0 6px; border-radius: 4px; letter-spacing: .02em; }
+  .lv-must { background: var(--must-bg); color: var(--must); }
+  .lv-q { background: var(--q-bg); color: var(--q); }
+  .lv-imo { background: var(--imo-bg); color: var(--imo); }
+  .lv-nit { background: var(--nit-bg); color: var(--nit); }
+
+  .review { margin-top: 6px; }
+  .riskline { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .points { margin: 6px 0 0; padding-left: 20px; }
+  .points li { margin: 2px 0; }
+  .section { margin-top: 16px; }
+  .section h3 { font-size: 12px; margin: 0 0 6px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .section ul { margin: 0; padding-left: 20px; }
+  .section li { margin: 2px 0; }
+
+  .finding { padding: 10px 0 10px 12px; border-left: 3px solid var(--border); margin-bottom: 8px; }
+  .finding.f-must { border-left-color: var(--must); }
+  .finding.f-q { border-left-color: var(--q); }
+  .finding.f-imo { border-left-color: var(--imo); }
+  .fhead { display: flex; gap: 8px; align-items: baseline; }
+  .fnum { color: var(--muted); font-size: 12px; min-width: 1.4em; }
+  .ftitle { font-weight: 600; }
+  .fmeta { margin: 2px 0 4px; font-size: 12px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .fmeta a, .fmeta .loc { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .cat { font-size: 11px; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; }
+  .reason { margin: 2px 0; }
+  .suggestion { margin: 2px 0; color: var(--muted); }
+  .suggestion .arrow { color: var(--accent); font-weight: 700; }
+
+  .linkbtn { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; font-size: 12px; }
+  .qa { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
+  .qa-toggle { font-size: 13px; }
+  .msg { margin: 8px 0; padding: 8px 12px; border-radius: 8px; }
+  .msg.user { background: var(--code-bg); white-space: pre-wrap; }
+  .msg.assistant { border: 1px solid var(--border); }
+  .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 2px; white-space: normal; }
+  .msg p { margin: 4px 0; }
+  .msg ul { margin: 4px 0; padding-left: 20px; }
+  .msg pre { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+  .msg pre code { background: none; padding: 0; word-break: normal; white-space: pre; }
+  .qa-status { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .qa-status::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1s infinite alternate; }
+  @keyframes pulse { from { opacity: .3; } to { opacity: 1; } }
+  .qa textarea { width: 100%; min-height: 64px; margin-top: 8px; font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; resize: vertical; }
+  .qa-actions { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  .qa-actions .primary { background: var(--accent); color: var(--card); border: none; border-radius: 6px; padding: 4px 16px; font: inherit; cursor: pointer; }
+  .qa-actions .primary:disabled { opacity: .5; cursor: default; }
+  .qa-error { color: var(--must); font-size: 12px; white-space: pre-wrap; margin-top: 6px; }
+  .qa-note { font-size: 12px; color: var(--muted); }
+  .error { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: var(--must-bg); color: var(--must); white-space: pre-wrap; font-size: 12px; }
+  .empty { color: var(--muted); padding: 32px 0; text-align: center; }
+  .older { margin-top: 12px; border-left: 3px solid var(--border); padding-left: 12px; }
+  .foot { margin-top: 14px; }
+  @media (max-width: 600px) {
+    .card-head { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>PR 自動レビュー</h1>
+  <div class="sub" id="sub"></div>
+  <div id="banner"></div>
+  <div class="counters" id="counters"></div>
+  <div class="toolbar">
+    <label>リポジトリ <select id="f-repo"></select></label>
+    <label>依頼経路 <select id="f-via"></select></label>
+    <label><input type="checkbox" id="f-hide-confirmed"> 確認済みを隠す</label>
+    <label><input type="checkbox" id="f-show-inactive"> 依頼が外れた PR も表示</label>
+  </div>
+  <div id="list"></div>
+</main>
+
+<!-- データは pr_review.py が埋め込む。< > & は \u 形式にエスケープ済み -->
+<script id="data" type="application/json">/*__DATA__*/null</script>
+<!-- 質問用の設定。server.py 経由で開いたときだけ埋め込まれる（ファイルを直接開いたときは null） -->
+<script id="qa-config" type="application/json">/*__QA__*/null</script>
+<script>
+(() => {
+  'use strict';
+  const data = JSON.parse(document.getElementById('data').textContent) || { prs: [], teams: [] };
+  const loadedAt = Date.now();
+
+  // ---- 保存（ブラウザごと。消えても困らない情報だけ置く） ----
+  const store = {
+    get(key, fallback) {
+      try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* 保存できなくても表示は続ける */ }
+    },
+  };
+  // 新しい push（SHA が変わる）か再依頼（requested_at が変わる）で「確認済み」が外れる
+  const confirmKey = (pr) => `prr:confirmed:${pr.repo}#${pr.number}@${pr.latest ? pr.latest.sha : ''}@${pr.requested_at || ''}`;
+  const isConfirmed = (pr) => !!pr.latest && store.get(confirmKey(pr), false);
+
+  // ---- DOM ヘルパー（PR 由来の文字列は必ず textContent で入れる） ----
+  function h(tag, props, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === 'class') node.className = v;
+      else if (k === 'text') node.textContent = v;
+      else if (k === 'href') node.href = v;
+      else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v);
+    }
+    for (const c of children.flat()) {
+      if (c === null || c === undefined || c === false) continue;
+      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return node;
+  }
+  // `コード` を <code> にする。それ以外はすべてテキストとして入れる
+  function rich(text) {
+    const frag = document.createDocumentFragment();
+    String(text ?? '').split('`').forEach((part, i) => {
+      if (!part) return;
+      frag.append(i % 2 ? h('code', { text: part }) : document.createTextNode(part));
+    });
+    return frag;
+  }
+  const fmt = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  };
+  const safeUrl = (u) => (typeof u === 'string' && u.startsWith('https://github.com/')) ? u : null;
+
+  const STATUS = {
+    reviewed: 'レビュー済み',
+    pending: 'レビュー待ち',
+    pending_update: '新しい push（レビュー待ち）',
+    pending_rerequest: '再依頼（レビュー待ち）',
+    retrying: '失敗（次の回に再試行）',
+    failed: '失敗（再試行の上限）',
+    inactive: '依頼が外れた',
+  };
+  const RISK = { high: 'リスク 高', medium: 'リスク 中', low: 'リスク 低' };
+  const LEVELS = ['must', 'q', 'imo', 'nit'];
+  const LEVEL_LABEL = { must: 'MUST', q: 'Q', imo: 'IMO', nit: 'NIT' };
+  // ---- 質問（server.py 経由で開いたときだけ使える） ----
+  // ファイルを直接開いたときは埋め込みが無く（目印のコメントのまま）JSON として読めないので null にする
+  let qa = null;
+  try { qa = JSON.parse(document.getElementById('qa-config').textContent); } catch { qa = null; }
+  const prKey = (pr) => `${pr.repo}#${pr.number}`;
+  let conversations = {};
+  const drafts = {};      // 書きかけの質問
+  const inflight = {};    // 答えを受け取っている途中の質問
+  const qaErrors = {};
+  const openQa = new Set();
+  const detailsOpen = {}; // レビュー結果の開閉を、描き直しても保つ
+
+  async function loadConversations() {
+    if (!qa) return;
+    try {
+      const res = await fetch('/api/qa', { headers: { 'X-PRR-Token': qa.token } });
+      if (res.ok) conversations = (await res.json()).conversations || {};
+    } catch { /* 取れなくても表示は続ける */ }
+  }
+
+  // Claude の答えの最低限の Markdown（コードブロック・箇条書き・`code`・**太字**）を、textContent だけで組み立てる
+  function inline(text) {
+    const frag = document.createDocumentFragment();
+    String(text).split('`').forEach((part, i) => {
+      if (i % 2) { if (part) frag.append(h('code', { text: part })); return; }
+      part.split('**').forEach((p, j) => { if (p) frag.append(j % 2 ? h('strong', { text: p }) : document.createTextNode(p)); });
+    });
+    return frag;
+  }
+  function md(text) {
+    const root = document.createDocumentFragment();
+    const lines = String(text || '').split('\n');
+    let list = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trimStart().startsWith('```')) {
+        const buf = [];
+        for (i++; i < lines.length && !lines[i].trimStart().startsWith('```'); i++) buf.push(lines[i]);
+        root.append(h('pre', {}, h('code', { text: buf.join('\n') })));
+        list = null;
+        continue;
+      }
+      const item = line.match(/^\s*(?:[-*・]|\d+\.)\s+(.*)$/);
+      if (item) {
+        if (!list) { list = h('ul'); root.append(list); }
+        list.append(h('li', {}, inline(item[1])));
+        continue;
+      }
+      list = null;
+      if (!line.trim()) continue;
+      const heading = line.match(/^#{1,6}\s+(.*)$/);
+      root.append(heading ? h('p', {}, h('strong', {}, inline(heading[1]))) : h('p', {}, inline(line)));
+    }
+    return root;
+  }
+
+  function streamNode(key) {
+    const node = h('div', { class: 'msg assistant', 'data-stream': key });
+    fillStream(node, inflight[key]);
+    return node;
+  }
+  function fillStream(node, st) {
+    node.replaceChildren(
+      h('div', { class: 'who', text: 'Claude' }),
+      md(st.text),
+      st.status ? h('div', { class: 'qa-status', text: st.status }) : null,
+    );
+  }
+  function updateStream(key) {
+    const node = [...document.querySelectorAll('[data-stream]')].find((n) => n.dataset.stream === key);
+    if (node && inflight[key]) fillStream(node, inflight[key]);
+  }
+
+  function onEvent(key, ev) {
+    const st = inflight[key];
+    if (ev.type === 'text') { st.text += ev.text; st.status = '書いています'; }
+    else if (ev.type === 'turn') { if (st.text && !st.text.endsWith('\n')) st.text += '\n\n'; }
+    else if (ev.type === 'status') st.status = ev.text;
+    else if (ev.type === 'done') { st.done = true; st.status = ''; }
+    else if (ev.type === 'error') st.error = ev.message;
+    updateStream(key);
+  }
+
+  async function send(pr) {
+    const key = prKey(pr);
+    const question = (drafts[key] || '').trim();
+    if (!qa || !question || inflight[key]) return;
+    inflight[key] = { question, text: '', status: '送信しています' };
+    drafts[key] = '';
+    delete qaErrors[key];
+    render();
+    try {
+      const res = await fetch('/api/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-PRR-Token': qa.token },
+        body: JSON.stringify({ repo: pr.repo, number: pr.number, question }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim()) onEvent(key, JSON.parse(line));
+        }
+      }
+      if (inflight[key].error) throw new Error(inflight[key].error);
+      if (!inflight[key].done) throw new Error('答えを最後まで受け取れませんでした');
+    } catch (e) {
+      qaErrors[key] = `答えを取得できませんでした: ${e.message || e}`;
+      drafts[key] = question; // もう一度送れるように戻す
+    }
+    await loadConversations();
+    delete inflight[key];
+    render();
+  }
+
+  function askAbout(pr, f, index) {
+    const key = prKey(pr);
+    const loc = f.line ? `${f.file}:${f.line}` : f.file;
+    drafts[key] = `> ${index + 1}. [${LEVEL_LABEL[f.level] || f.level}] ${loc} ${f.title}\n\n`;
+    openQa.add(key);
+    render();
+    const ta = [...document.querySelectorAll('[data-qa-input]')].find((n) => n.dataset.qaInput === key);
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+      ta.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+
+  function qaPanel(pr) {
+    const key = prKey(pr);
+    const convs = conversations[key] || [];
+    const current = convs.filter((c) => c.sha === pr.head_sha).pop();
+    const older = convs.filter((c) => c !== current);
+    const st = inflight[key];
+    const count = current ? current.messages.filter((x) => x.role === 'user').length : 0;
+    const open = openQa.has(key) || !!st;
+    const toggle = h('button', {
+      class: 'linkbtn qa-toggle', type: 'button',
+      onclick: () => { if (open) openQa.delete(key); else openQa.add(key); render(); },
+    }, `${open ? '▾' : '▸'} Claude に質問${count ? `（${count} 件）` : ''}`);
+    if (!open) return h('div', { class: 'qa' }, toggle);
+    if (!qa) {
+      return h('div', { class: 'qa' }, toggle, h('div', { class: 'qa-note' },
+        '質問するには ', h('a', { href: 'http://127.0.0.1:8765/', text: 'http://127.0.0.1:8765/' }), ' で開いてください（サーバーが動いている必要があります）。'));
+    }
+    const msgNode = (msg) => (msg.role === 'user'
+      ? h('div', { class: 'msg user' }, h('div', { class: 'who', text: `自分 ${fmt(msg.at)}` }), msg.text)
+      : h('div', { class: 'msg assistant' }, h('div', { class: 'who', text: `Claude ${fmt(msg.at)}` }), md(msg.text)));
+    const textarea = h('textarea', { placeholder: 'この PR について質問（⌘ + Enter で送信）', 'data-qa-input': key });
+    textarea.value = drafts[key] || '';
+    textarea.addEventListener('input', () => { drafts[key] = textarea.value; });
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); send(pr); }
+    });
+    const sendBtn = h('button', { class: 'primary', type: 'button', onclick: () => send(pr) }, '送信');
+    sendBtn.disabled = !!st;
+    return h('div', { class: 'qa' }, toggle,
+      older.length ? h('details', { class: 'older' },
+        h('summary', { text: `前の push での会話（${older.length} 件）` }),
+        older.map((c) => h('div', {}, c.messages.map(msgNode)))) : null,
+      current ? current.messages.map(msgNode) : null,
+      st ? h('div', { class: 'msg user' }, h('div', { class: 'who', text: '自分' }), st.question) : null,
+      st ? streamNode(key) : null,
+      qaErrors[key] ? h('div', { class: 'qa-error', text: qaErrors[key] }) : null,
+      textarea,
+      h('div', { class: 'qa-actions' }, sendBtn, h('span', { class: 'qa-note', text: '答えは自分にだけ表示されます。PR には投稿されません。' })),
+    );
+  }
+
+  const MY_STATUS = ['not_fixed', 'partial', 'unclear', 'replied', 'fixed'];
+  const MY_STATUS_LABEL = { not_fixed: '未対応', partial: '一部対応', unclear: '判断できない', replied: '返信で回答', fixed: '対応済み' };
+
+  // ---- ヘッダー ----
+  const lastRun = data.last_run;
+  document.getElementById('sub').textContent =
+    `最終更新 ${fmt(data.generated_at)}` +
+    (lastRun ? ` ／ 最終実行 ${fmt(lastRun.finished_at)}（${lastRun.ok ? '成功' : '失敗'}・レビュー ${lastRun.reviewed} 件）` : '') +
+    (data.login ? ` ／ ${data.login}` : '');
+  if (lastRun && !lastRun.ok) {
+    document.getElementById('banner').append(h('div', { class: 'banner', text: `前回の実行が失敗しました: ${lastRun.message}` }));
+  }
+
+  // ---- フィルタ ----
+  const repoSel = document.getElementById('f-repo');
+  const viaSel = document.getElementById('f-via');
+  const hideConfirmed = document.getElementById('f-hide-confirmed');
+  const showInactive = document.getElementById('f-show-inactive');
+  const uniq = (xs) => [...new Set(xs)].sort();
+  const fillSelect = (sel, values, saved) => {
+    sel.append(h('option', { value: '', text: 'すべて' }));
+    for (const v of values) sel.append(h('option', { value: v, text: v }));
+    sel.value = values.includes(saved) ? saved : '';
+  };
+  const saved = store.get('prr:filters', {});
+  fillSelect(repoSel, uniq(data.prs.map((p) => p.repo)), saved.repo);
+  fillSelect(viaSel, uniq(data.prs.flatMap((p) => p.requested_via || [])), saved.via);
+  hideConfirmed.checked = !!saved.hideConfirmed;
+  // URL に ?all を付けて開くと、依頼が外れた PR も表示する
+  showInactive.checked = !!saved.showInactive || new URLSearchParams(location.search).has('all');
+  for (const el of [repoSel, viaSel, hideConfirmed, showInactive]) {
+    el.addEventListener('change', () => {
+      store.set('prr:filters', { repo: repoSel.value, via: viaSel.value, hideConfirmed: hideConfirmed.checked, showInactive: showInactive.checked });
+      render();
+    });
+  }
+
+  // ---- 1 件分のレビュー結果 ----
+  function findingNode(pr, sha, f, index) {
+    const file = f.file || '';
+    const shortFile = file.split('/').slice(-2).join('/');
+    const loc = f.line ? `${shortFile}:${f.line}` : shortFile;
+    const url = sha && file ? safeUrl(`https://github.com/${data.org}/${pr.repo}/blob/${sha}/${file.split('/').map(encodeURIComponent).join('/')}${f.line ? `#L${f.line}` : ''}`) : null;
+    return h('div', { class: `finding f-${f.level}` },
+      h('div', { class: 'fhead' },
+        h('span', { class: 'fnum', text: `${index + 1}.` }),
+        h('span', { class: `lv lv-${f.level}`, text: LEVEL_LABEL[f.level] || f.level }),
+        h('span', { class: 'ftitle' }, rich(f.title))),
+      h('div', { class: 'fmeta' },
+        url ? h('a', { href: url, target: '_blank', rel: 'noopener', title: file, text: loc }) : h('span', { class: 'loc', title: file, text: loc }),
+        f.category ? h('span', { class: 'cat', text: f.category }) : null,
+        h('button', { class: 'linkbtn', type: 'button', onclick: () => askAbout(pr, f, index) }, 'これについて聞く')),
+      h('div', { class: 'reason' }, rich(f.reason)),
+      f.suggestion ? h('div', { class: 'suggestion' }, h('span', { class: 'arrow', text: '→ ' }), rich(f.suggestion)) : null,
+    );
+  }
+
+  function myCommentNode(pr, sha, m) {
+    const file = m.file || '';
+    const loc = file ? (m.line ? `${file.split('/').slice(-2).join('/')}:${m.line}` : file.split('/').slice(-2).join('/')) : 'PR 全体';
+    return h('div', { class: 'mycomment' },
+      h('div', { class: 'mhead' },
+        h('span', { class: `ms ms-${m.status}`, text: MY_STATUS_LABEL[m.status] || m.status }),
+        h('span', { class: 'loc', title: file, text: loc }),
+        h('span', {}, rich(m.comment))),
+      m.note ? h('div', { class: 'note' }, h('span', { class: 'arrow', text: '→ ' }), rich(m.note)) : null,
+    );
+  }
+
+  function reviewBody(pr, review) {
+    const r = review.result || {};
+    const myComments = (r.my_comments_status || []).slice().sort((a, b) => MY_STATUS.indexOf(a.status) - MY_STATUS.indexOf(b.status));
+    // 旧形式（summary が 1 段落）の結果も表示できるようにしておく
+    const points = r.summary_points || (r.summary ? [r.summary] : []);
+    const findings = (r.findings || []).slice().sort((a, b) => LEVELS.indexOf(a.level) - LEVELS.indexOf(b.level));
+    const bullets = (items) => h('ul', {}, items.map((t) => h('li', {}, rich(t))));
+    return h('div', { class: 'review' },
+      h('div', {},
+        h('div', { class: 'riskline' },
+          h('span', { class: `badge risk-${r.risk}`, text: RISK[r.risk] || r.risk }),
+          r.risk_reason ? h('span', { class: 'sub' }, rich(r.risk_reason)) : null),
+        h('ul', { class: 'points' }, points.map((t) => h('li', {}, rich(t))))),
+      myComments.length ? h('div', { class: 'section' },
+        h('h3', { text: `自分の指摘への対応状況（${myComments.length} 件）` }),
+        myComments.map((m) => myCommentNode(pr, review.sha, m))) : null,
+      h('div', { class: 'section' },
+        h('h3', { text: `${myComments.length ? '新しい指摘' : '指摘'} ${findings.length} 件` }),
+        findings.length ? findings.map((f, i) => findingNode(pr, review.sha, f, i)) : h('div', { class: 'sub', text: '指摘はありません。' })),
+      (r.check_points || []).length ? h('div', { class: 'section' }, h('h3', { text: '確認ポイント' }), bullets(r.check_points)) : null,
+      (r.good_points || []).length ? h('div', { class: 'section' }, h('h3', { text: '良い点' }), bullets(r.good_points)) : null,
+      r.changes_since_previous ? h('div', { class: 'section' }, h('h3', { text: '前回のレビューからの変化' }), h('div', {}, rich(r.changes_since_previous))) : null,
+      h('div', { class: 'sub foot', text: `${fmt(review.reviewed_at)} に ${review.sha.slice(0, 7)} をレビュー（${review.mode === 'summary' ? `差分 ${review.diff_lines} 行のため要約中心` : '全体'}）` }),
+    );
+  }
+
+  function levelCounts(review) {
+    const result = (review && review.result) || {};
+    const fs = result.findings || [];
+    const ms = result.my_comments_status || [];
+    const open = ms.filter((m) => m.status === 'not_fixed' || m.status === 'partial').length;
+    return h('span', { class: 'counts' },
+      open ? h('span', { class: 'ms ms-not_fixed', text: `自分の指摘 未対応 ${open}` }) : null,
+      LEVELS.map((lv) => {
+        const n = fs.filter((f) => f.level === lv).length;
+        return n ? h('span', { class: `lv lv-${lv}`, text: `${LEVEL_LABEL[lv]} ${n}` }) : null;
+      }));
+  }
+
+  function card(pr) {
+    const confirmed = isConfirmed(pr);
+    const url = safeUrl(pr.url);
+    const checkbox = h('input', { type: 'checkbox' });
+    checkbox.checked = confirmed;
+    checkbox.addEventListener('change', () => { store.set(confirmKey(pr), checkbox.checked); render(); });
+
+    const head = h('div', { class: 'card-head' },
+      h('div', {},
+        h('div', { class: 'title' },
+          h('span', { class: 'num', text: `${pr.repo} #${pr.number}` }),
+          url ? h('a', { href: url, target: '_blank', rel: 'noopener', text: pr.title }) : pr.title),
+        h('div', { class: 'meta' },
+          h('span', { class: `badge st-${pr.status}`, text: STATUS[pr.status] || pr.status }),
+          pr.draft ? h('span', { class: 'badge', text: 'draft' }) : null,
+          pr.rerequest_count > 0 ? h('span', { class: 'badge rereq', text: `再依頼 ${fmt(pr.requested_at)}` }) : null,
+          (pr.requested_via || []).map((v) => h('span', { class: 'badge via', text: v === '自分' ? '自分宛て' : `チーム: ${v}` })),
+          h('span', { text: `作成者 ${pr.author}` }),
+          h('span', { text: `→ ${pr.base}` }),
+          h('span', { text: `+${pr.additions} / −${pr.deletions}（${pr.changed_files} ファイル）` }),
+        )),
+      pr.latest ? h('label', { class: 'confirm' }, checkbox, '確認済み') : null,
+    );
+
+    const parts = [head];
+    if (pr.last_error && (pr.status === 'retrying' || pr.status === 'failed')) {
+      parts.push(h('div', { class: 'error', text: `${fmt(pr.last_error.at)} 失敗（${pr.last_error.attempts}/${data.max_attempts} 回目）: ${pr.last_error.message}` }));
+    }
+    if (pr.latest) {
+      const details = h('details', {},
+        h('summary', {}, 'レビュー結果', levelCounts(pr.latest),
+          pr.status === 'pending_update' ? h('span', { class: 'sub', text: '（古い push に対する結果です）' }) : null,
+          pr.status === 'pending_rerequest' ? h('span', { class: 'sub', text: '（再依頼前の結果です）' }) : null),
+        reviewBody(pr, pr.latest),
+        (pr.older || []).length ? h('details', { class: 'older' },
+          h('summary', { text: `過去のレビュー（${pr.older.length} 件）` }),
+          pr.older.map((rv) => h('div', { class: 'older' }, reviewBody(pr, rv)))) : null,
+      );
+      // 未確認のものは最初から開いておき、確認済みは畳む。自分で開け閉めしたらそれを保つ
+      const key = prKey(pr);
+      details.open = detailsOpen[key] ?? (!confirmed && pr.active);
+      details.addEventListener('toggle', () => { detailsOpen[key] = details.open; });
+      parts.push(details);
+    }
+    parts.push(qaPanel(pr));
+    return h('div', { class: `card${confirmed ? ' confirmed' : ''}` }, parts);
+  }
+
+  // ---- 一覧 ----
+  function render() {
+    const list = document.getElementById('list');
+    list.replaceChildren();
+    const active = data.prs.filter((p) => p.active);
+    const counters = document.getElementById('counters');
+    const c = (n, label) => h('div', { class: 'counter' }, h('b', { text: String(n) }), h('span', { text: label }));
+    counters.replaceChildren(
+      c(active.length, '依頼中'),
+      c(active.filter((p) => p.status === 'reviewed' && !isConfirmed(p)).length, '未確認'),
+      c(active.filter((p) => ['pending', 'pending_update', 'pending_rerequest', 'retrying'].includes(p.status)).length, 'レビュー待ち'),
+      c(active.filter((p) => p.status === 'failed').length, '失敗'),
+    );
+
+    const rows = data.prs
+      .filter((p) => showInactive.checked || p.active)
+      .filter((p) => !repoSel.value || p.repo === repoSel.value)
+      .filter((p) => !viaSel.value || (p.requested_via || []).includes(viaSel.value))
+      .filter((p) => !(hideConfirmed.checked && isConfirmed(p)))
+      .sort((a, b) =>
+        (b.active - a.active) ||
+        (isConfirmed(a) - isConfirmed(b)) ||
+        String((b.latest && b.latest.reviewed_at) || b.first_seen_at || '').localeCompare(String((a.latest && a.latest.reviewed_at) || a.first_seen_at || '')));
+
+    if (!rows.length) {
+      list.append(h('div', { class: 'empty', text: data.prs.length ? '条件に合う PR はありません。' : 'まだレビュー依頼はありません。' }));
+      return;
+    }
+    for (const pr of rows) list.append(card(pr));
+  }
+  // URL の末尾に #qa を付けて開くと、質問欄をすべて開いた状態にする
+  if (location.hash === '#qa') data.prs.forEach((pr) => openQa.add(prKey(pr)));
+  render();
+  loadConversations().then(render);
+
+  // ファイルは定期的に作り直されるので、タブに戻ってきたときに読み直す。
+  // 答えを受け取っている途中や、質問を書きかけのときは読み直さない
+  document.addEventListener('visibilitychange', () => {
+    const busy = Object.keys(inflight).length > 0 || Object.values(drafts).some((d) => d && d.trim());
+    if (!document.hidden && !busy && Date.now() - loadedAt > 60 * 1000) location.reload();
+  });
+})();
+</script>
+</body>
+</html>

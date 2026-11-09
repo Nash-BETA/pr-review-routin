@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 定期レビューのジョブ。bin/install.sh が __XXX__ を埋めて ~/Library/LaunchAgents に置く -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <!-- bash を通さず python3 を直接起動する。リポジトリを ~/Desktop などに置いたとき、
+       macOS のプライバシー保護（TCC）で bash はスクリプトを読めないが、許可のある python3 なら読めるため -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/lib/pr_review.py</string>
+    <string>--launchd</string>
+  </array>
+
+  <!-- launchd は PATH をほぼ空で渡すため、claude / gh の場所を含む PATH を渡す -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <!-- 15 分ごと。曜日と時間帯の判定はスクリプト側で行う。スリープ中の分は復帰後に 1 回だけ実行される -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/launchd.err.log</string>
+
+  <!-- 5 件のレビューで 1 時間を超えることがあるため、停止時の猶予を長めに取る -->
+  <key>ExitTimeOut</key>
+  <integer>3600</integer>
+</dict>
+</plist>
