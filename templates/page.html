@@ -48,6 +48,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     background: var(--bg);
@@ -67,6 +68,12 @@
   h1 { font-size: 20px; margin: 0 0 4px; }
   .sub { color: var(--muted); font-size: 12px; }
   .banner { margin: 12px 0; padding: 10px 12px; border-radius: 8px; background: var(--must-bg); color: var(--must); white-space: pre-wrap; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 16px; border-bottom: 1px solid var(--border); }
+  .tab { display: inline-flex; gap: 6px; align-items: center; background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: 8px 14px; font: inherit; font-weight: 600; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .tab:hover { color: var(--fg); }
+  .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  .tcount { font-size: 11px; line-height: 1.6; padding: 0 7px; border-radius: 999px; background: var(--code-bg); color: var(--muted); }
+  .tcount.unread { background: var(--accent); color: var(--card); }
   .counters { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
   .counter { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; min-width: 110px; }
   .counter b { display: block; font-size: 20px; }
@@ -170,12 +177,13 @@
   <h1>PR 自動レビュー</h1>
   <div class="sub" id="sub"></div>
   <div id="banner"></div>
+  <div class="tabs" id="tabs" role="tablist"></div>
   <div class="counters" id="counters"></div>
   <div class="toolbar">
     <label>リポジトリ <select id="f-repo"></select></label>
-    <label>依頼経路 <select id="f-via"></select></label>
+    <label id="f-via-wrap">依頼経路 <select id="f-via"></select></label>
     <label><input type="checkbox" id="f-hide-confirmed"> 確認済みを隠す</label>
-    <label><input type="checkbox" id="f-show-inactive"> 依頼が外れた PR も表示</label>
+    <label><input type="checkbox" id="f-show-inactive"> <span id="f-show-inactive-label"></span></label>
   </div>
   <div id="list"></div>
 </main>
@@ -246,6 +254,16 @@
     failed: '失敗（再試行の上限）',
     inactive: '依頼が外れた',
   };
+  // 自分の PR の inactive は「依頼が外れた」ではなく、クローズ（マージ）されたもの
+  const statusLabel = (pr) => (pr.status === 'inactive' && roleOf(pr) === 'author' ? 'クローズ済み' : STATUS[pr.status] || pr.status);
+  // タブ。PR の role（reviewer / author）で分ける。role を持たない記録は、自分の PR を扱う前の版で作った依頼された PR
+  const TABS = [
+    { id: 'reviewer', label: 'レビュー依頼', activeLabel: '依頼中', showInactiveLabel: '依頼が外れた PR も表示', empty: 'まだレビュー依頼はありません。' },
+    { id: 'author', label: '自分の PR', activeLabel: 'オープン中', showInactiveLabel: 'クローズした PR も表示', empty: 'オープン中の自分の PR はありません。' },
+  ];
+  const roleOf = (pr) => pr.role || 'reviewer';
+  // 自分の PR のレビューを無効にしていて記録も無ければ、タブを出さない（以前と同じ見た目になる）
+  const visibleTabs = TABS.filter((t) => t.id === 'reviewer' || data.my_prs || data.prs.some((p) => roleOf(p) === t.id));
   const RISK = { high: 'リスク 高', medium: 'リスク 中', low: 'リスク 低' };
   const LEVELS = ['must', 'q', 'imo', 'nit'];
   const LEVEL_LABEL = { must: 'MUST', q: 'Q', imo: 'IMO', nit: 'NIT' };
@@ -440,29 +458,75 @@
     document.getElementById('banner').append(h('div', { class: 'banner', text: `前回の実行が失敗しました: ${lastRun.message}` }));
   }
 
-  // ---- フィルタ ----
+  // ---- タブ ----
+  // URL に ?tab=author（または ?tab=reviewer）を付けて開くと、そのタブを選ぶ。無ければ前回選んだタブ
+  const params = new URLSearchParams(location.search);
+  const tabIds = visibleTabs.map((t) => t.id);
+  let tab = [params.get('tab'), store.get('prr:tab', 'reviewer')].find((id) => tabIds.includes(id)) || 'reviewer';
+  const currentTab = () => TABS.find((t) => t.id === tab);
+  const inTab = (pr) => roleOf(pr) === tab;
+  const unconfirmed = (prs) => prs.filter((p) => p.status === 'reviewed' && !isConfirmed(p));
+
+  function renderTabs() {
+    const bar = document.getElementById('tabs');
+    bar.hidden = visibleTabs.length < 2;
+    bar.replaceChildren(...visibleTabs.map((t) => {
+      const active = data.prs.filter((p) => p.active && roleOf(p) === t.id);
+      const unread = unconfirmed(active).length;
+      return h('button', {
+        class: 'tab', type: 'button', role: 'tab', 'aria-selected': String(t.id === tab),
+        onclick: () => selectTab(t.id),
+      },
+      t.label,
+      h('span', { class: 'tcount', title: `${t.activeLabel} ${active.length} 件`, text: String(active.length) }),
+      unread ? h('span', { class: 'tcount unread', title: `未確認 ${unread} 件`, text: `未確認 ${unread}` }) : null);
+    }));
+  }
+
+  function selectTab(id) {
+    if (id === tab) return;
+    tab = id;
+    store.set('prr:tab', tab);
+    setupFilters();
+    render();
+    window.scrollTo({ top: 0 });
+  }
+
+  // ---- フィルタ（タブごとに保存する） ----
   const repoSel = document.getElementById('f-repo');
   const viaSel = document.getElementById('f-via');
+  const viaWrap = document.getElementById('f-via-wrap');
   const hideConfirmed = document.getElementById('f-hide-confirmed');
   const showInactive = document.getElementById('f-show-inactive');
+  const showInactiveLabel = document.getElementById('f-show-inactive-label');
+  const showAll = params.has('all'); // URL に ?all を付けて開くと、依頼が外れた PR・クローズした PR も表示する
   const uniq = (xs) => [...new Set(xs)].sort();
   const fillSelect = (sel, values, saved) => {
-    sel.append(h('option', { value: '', text: 'すべて' }));
+    sel.replaceChildren(h('option', { value: '', text: 'すべて' }));
     for (const v of values) sel.append(h('option', { value: v, text: v }));
     sel.value = values.includes(saved) ? saved : '';
   };
-  const saved = store.get('prr:filters', {});
-  fillSelect(repoSel, uniq(data.prs.map((p) => p.repo)), saved.repo);
-  fillSelect(viaSel, uniq(data.prs.flatMap((p) => p.requested_via || [])), saved.via);
-  hideConfirmed.checked = !!saved.hideConfirmed;
-  // URL に ?all を付けて開くと、依頼が外れた PR も表示する
-  showInactive.checked = !!saved.showInactive || new URLSearchParams(location.search).has('all');
+  // タブを足す前の版は prr:filters に保存していたので、レビュー依頼のタブではそれを引き継ぐ
+  const filterKey = () => `prr:filters:${tab}`;
+  const savedFilters = () => store.get(filterKey(), tab === 'reviewer' ? store.get('prr:filters', {}) : {});
+
+  function setupFilters() {
+    const saved = savedFilters();
+    const prs = data.prs.filter(inTab);
+    fillSelect(repoSel, uniq(prs.map((p) => p.repo)), saved.repo);
+    fillSelect(viaSel, uniq(prs.flatMap((p) => p.requested_via || [])), saved.via);
+    viaWrap.hidden = tab !== 'reviewer';
+    hideConfirmed.checked = !!saved.hideConfirmed;
+    showInactive.checked = !!saved.showInactive || showAll;
+    showInactiveLabel.textContent = currentTab().showInactiveLabel;
+  }
   for (const el of [repoSel, viaSel, hideConfirmed, showInactive]) {
     el.addEventListener('change', () => {
-      store.set('prr:filters', { repo: repoSel.value, via: viaSel.value, hideConfirmed: hideConfirmed.checked, showInactive: showInactive.checked });
+      store.set(filterKey(), { repo: repoSel.value, via: viaSel.value, hideConfirmed: hideConfirmed.checked, showInactive: showInactive.checked });
       render();
     });
   }
+  setupFilters();
 
   // ---- 1 件分のレビュー結果 ----
   function findingNode(pr, sha, f, index) {
@@ -548,11 +612,11 @@
           h('span', { class: 'num', text: `${pr.repo} #${pr.number}` }),
           url ? h('a', { href: url, target: '_blank', rel: 'noopener', text: pr.title }) : pr.title),
         h('div', { class: 'meta' },
-          h('span', { class: `badge st-${pr.status}`, text: STATUS[pr.status] || pr.status }),
+          h('span', { class: `badge st-${pr.status}`, text: statusLabel(pr) }),
           pr.draft ? h('span', { class: 'badge', text: 'draft' }) : null,
           pr.rerequest_count > 0 ? h('span', { class: 'badge rereq', text: `再依頼 ${fmt(pr.requested_at)}` }) : null,
           (pr.requested_via || []).map((v) => h('span', { class: 'badge via', text: v === '自分' ? '自分宛て' : `チーム: ${v}` })),
-          h('span', { text: `作成者 ${pr.author}` }),
+          roleOf(pr) === 'reviewer' ? h('span', { text: `作成者 ${pr.author}` }) : null,
           h('span', { text: `→ ${pr.base}` }),
           h('span', { text: `+${pr.additions} / −${pr.deletions}（${pr.changed_files} ファイル）` }),
         )),
@@ -585,22 +649,24 @@
 
   // ---- 一覧 ----
   function render() {
+    renderTabs();
     const list = document.getElementById('list');
     list.replaceChildren();
-    const active = data.prs.filter((p) => p.active);
+    const prs = data.prs.filter(inTab);
+    const active = prs.filter((p) => p.active);
     const counters = document.getElementById('counters');
     const c = (n, label) => h('div', { class: 'counter' }, h('b', { text: String(n) }), h('span', { text: label }));
     counters.replaceChildren(
-      c(active.length, '依頼中'),
-      c(active.filter((p) => p.status === 'reviewed' && !isConfirmed(p)).length, '未確認'),
+      c(active.length, currentTab().activeLabel),
+      c(unconfirmed(active).length, '未確認'),
       c(active.filter((p) => ['pending', 'pending_update', 'pending_rerequest', 'retrying'].includes(p.status)).length, 'レビュー待ち'),
       c(active.filter((p) => p.status === 'failed').length, '失敗'),
     );
 
-    const rows = data.prs
+    const rows = prs
       .filter((p) => showInactive.checked || p.active)
       .filter((p) => !repoSel.value || p.repo === repoSel.value)
-      .filter((p) => !viaSel.value || (p.requested_via || []).includes(viaSel.value))
+      .filter((p) => tab !== 'reviewer' || !viaSel.value || (p.requested_via || []).includes(viaSel.value))
       .filter((p) => !(hideConfirmed.checked && isConfirmed(p)))
       .sort((a, b) =>
         (b.active - a.active) ||
@@ -608,7 +674,7 @@
         String((b.latest && b.latest.reviewed_at) || b.first_seen_at || '').localeCompare(String((a.latest && a.latest.reviewed_at) || a.first_seen_at || '')));
 
     if (!rows.length) {
-      list.append(h('div', { class: 'empty', text: data.prs.length ? '条件に合う PR はありません。' : 'まだレビュー依頼はありません。' }));
+      list.append(h('div', { class: 'empty', text: prs.length ? '条件に合う PR はありません。' : currentTab().empty }));
       return;
     }
     for (const pr of rows) list.append(card(pr));

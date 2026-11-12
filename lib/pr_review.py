@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""自分・所属チームにレビュー依頼が来ている PR を Claude にレビューさせ、結果をローカルの HTML に出す。
+"""自分・所属チームにレビュー依頼が来ている PR と、自分が作成した PR を Claude にレビューさせ、結果をローカルの HTML に出す。
 
 処理は 3 段に分かれる。
-  1. 取得: 自分の gh で依頼中の PR を探し、本文・差分・head 時点のファイル一式を作業ディレクトリに展開する
+  1. 取得: 自分の gh で依頼中の PR と自分が作成したオープン中の PR を探し、本文・差分・head 時点のファイル一式を作業ディレクトリに展開する
   2. レビュー: claude -p を Read / Grep / Glob だけで動かし、結果を JSON で受け取る
   3. 生成: 保存した JSON から out/index.html を作り直す
 
@@ -100,6 +100,12 @@ KEEP_INACTIVE_DAYS = 30
 RULE_FILES = [config_path(p) for p in os.environ.get("PR_REVIEW_RULE_FILES", "").split(":") if p.strip()]
 # レビューの指示に付け足す、利用者ごとの指示（任意）
 EXTRA_PROMPT_FILE = config_path(os.environ["PR_REVIEW_EXTRA_PROMPT"]) if os.environ.get("PR_REVIEW_EXTRA_PROMPT") else None
+# 自分が作成したオープン中の PR もレビューするか（既定はする。draft も含める）
+MY_PRS = os.environ.get("PR_REVIEW_MY_PRS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# PR ごとの記録が、どちらの立場で見つけたものか
+ROLE_REVIEWER = "reviewer"  # 自分か所属チームにレビュー依頼が来た PR
+ROLE_AUTHOR = "author"  # 自分が作成した PR
 
 # 自動で動く曜日と時間帯（Mac のタイムゾーン）
 #   曜日: 1 = 月曜 〜 7 = 日曜。「1-5」なら月〜金
@@ -201,6 +207,16 @@ def all_records() -> list[tuple[Path, dict]]:
     return [(path, load_record(path)) for path in sorted(REVIEWS_DIR.glob("*.json"))]
 
 
+def role(rec: dict) -> str:
+    """記録の立場。role を持たない記録は、自分の PR を扱う前の版で作った、依頼された PR の記録。"""
+    return rec.get("role", ROLE_REVIEWER)
+
+
+def rerequest_pending(rec: dict) -> bool:
+    """再依頼されて、まだレビューし直していないか。自分の PR には再依頼が無い。"""
+    return role(rec) == ROLE_REVIEWER and bool(rec.get("rerequest_pending"))
+
+
 def needs_review(rec: dict) -> bool:
     if not rec.get("active"):
         return False
@@ -208,7 +224,7 @@ def needs_review(rec: dict) -> bool:
     if rec.get("attempts", {}).get(sha, 0) >= MAX_ATTEMPTS:
         return False
     # 再依頼されたら、push が無くても自分の指摘への対応状況を出すためにレビューし直す
-    if rec.get("rerequest_pending"):
+    if rerequest_pending(rec):
         return True
     return not any(r["sha"] == sha for r in rec.get("reviews", []))
 
@@ -227,19 +243,59 @@ def my_teams() -> list[str]:
     return gh_json_lines("user/teams", jq, paginate=True)
 
 
-def sync_requests(login: str, teams: list[str]) -> int:
-    """依頼中の PR を探して保存データを最新にする。依頼が外れた PR は inactive にする。"""
-    query = f"is:pr is:open org:{ORG} review-requested:{login}"
+def search_prs(query: str) -> list[tuple[str, int]]:
+    """PR を検索し、(リポジトリ名, 番号) の一覧を返す。"""
     items = gh_json_lines(
         "search/issues",
         '.items[] | {repo: (.repository_url | split("/") | .[-1]), number} | @json',
         paginate=True,
         params={"q": query, "per_page": "100"},
     )
+    return [(item["repo"], int(item["number"])) for item in items]
 
-    seen: set[str] = set()
-    for item in items:
-        repo, number = item["repo"], int(item["number"])
+
+def new_record(repo: str, number: int, rec_role: str) -> dict:
+    return {
+        "repo": repo,
+        "number": number,
+        "role": rec_role,
+        "first_seen_at": now_iso(),
+        "requested_at": now_iso(),
+        "rerequest_count": 0,
+        "reviews": [],
+        "attempts": {},
+    }
+
+
+def apply_pr(rec: dict, pr: dict) -> None:
+    """GitHub から取った PR の情報を記録に入れ、有効にする。"""
+    rec.update({
+        "url": pr["html_url"],
+        "title": pr["title"],
+        "author": pr["user"]["login"],
+        "base": pr["base"]["ref"],
+        "base_sha": pr["base"]["sha"],
+        "head": pr["head"]["ref"],
+        "head_sha": pr["head"]["sha"],
+        "draft": bool(pr.get("draft")),
+        "additions": pr.get("additions", 0),
+        "deletions": pr.get("deletions", 0),
+        "changed_files": pr.get("changed_files", 0),
+        "body": pr.get("body") or "",
+        "active": True,
+        "last_seen_at": now_iso(),
+    })
+    rec.pop("inactive_since", None)
+    # 今の head 以外の試行回数は不要
+    rec["attempts"] = {k: v for k, v in rec.get("attempts", {}).items() if k == rec["head_sha"]}
+
+
+def sync_requests(login: str, teams: list[str], seen: set[str]) -> int:
+    """依頼中の PR を探して保存データを最新にする。見つけた記録のファイル名を seen に足す。"""
+    # 作成者はレビュー依頼の対象にならないが、念のため自分の PR を除き、「自分の PR」と重ならないようにする
+    found = search_prs(f"is:pr is:open org:{ORG} review-requested:{login} -author:{login}")
+
+    for repo, number in found:
         pr = gh_json(f"repos/{ORG}/{repo}/pulls/{number}")
         requested = gh_json(f"repos/{ORG}/{repo}/pulls/{number}/requested_reviewers")
 
@@ -261,15 +317,8 @@ def sync_requests(login: str, teams: list[str]) -> int:
 
         path = record_path(repo, number)
         existed = path.exists()
-        rec = load_record(path) if existed else {
-            "repo": repo,
-            "number": number,
-            "first_seen_at": now_iso(),
-            "requested_at": now_iso(),
-            "rerequest_count": 0,
-            "reviews": [],
-            "attempts": {},
-        }
+        rec = load_record(path) if existed else new_record(repo, number, ROLE_REVIEWER)
+        rec["role"] = ROLE_REVIEWER
         # my_last_review_at を持たない古い記録は、初めて見た扱いにする（再依頼とは判定しない）
         known = existed and "my_last_review_at" in rec
         was_inactive = existed and not rec.get("active", True)
@@ -286,29 +335,36 @@ def sync_requests(login: str, teams: list[str]) -> int:
         # 古い検索結果を拾ったとき（依頼先が空）は更新しない。更新すると、その後の本当の再依頼を見逃す
         if via or not known:
             rec["my_last_review_at"] = my_last_review_at
-        rec.update({
-            "url": pr["html_url"],
-            "title": pr["title"],
-            "author": pr["user"]["login"],
-            "base": pr["base"]["ref"],
-            "base_sha": pr["base"]["sha"],
-            "head": pr["head"]["ref"],
-            "head_sha": pr["head"]["sha"],
-            "draft": bool(pr.get("draft")),
-            "additions": pr.get("additions", 0),
-            "deletions": pr.get("deletions", 0),
-            "changed_files": pr.get("changed_files", 0),
-            "body": pr.get("body") or "",
-            "requested_via": via or ["不明"],
-            "active": True,
-            "last_seen_at": now_iso(),
-        })
-        rec.pop("inactive_since", None)
-        # 今の head 以外の試行回数は不要
-        rec["attempts"] = {k: v for k, v in rec.get("attempts", {}).items() if k == rec["head_sha"]}
+        rec["requested_via"] = via or ["不明"]
+        apply_pr(rec, pr)
         write_json(path, rec)
         seen.add(path.name)
 
+    return len(found)
+
+
+def sync_my_prs(login: str, seen: set[str]) -> int:
+    """自分が作成したオープン中の PR（draft も含む）を探して保存データを最新にする。見つけた記録のファイル名を seen に足す。
+
+    依頼された PR と違い、再依頼は無い。head が変わったらレビューし直す。
+    """
+    found = search_prs(f"is:pr is:open org:{ORG} author:{login}")
+    for repo, number in found:
+        path = record_path(repo, number)
+        if path.name in seen:  # 依頼された PR として扱ったものは重ねない（検索の時点で除いているので、通常は起きない）
+            continue
+        pr = gh_json(f"repos/{ORG}/{repo}/pulls/{number}")
+        rec = load_record(path) if path.exists() else new_record(repo, number, ROLE_AUTHOR)
+        rec["role"] = ROLE_AUTHOR
+        rec["requested_via"] = []
+        apply_pr(rec, pr)
+        write_json(path, rec)
+        seen.add(path.name)
+    return len(found)
+
+
+def deactivate_unseen(seen: set[str]) -> None:
+    """今回見つからなかった PR（依頼が外れた・クローズした）を inactive にし、外れてから日が経ったものは消す。"""
     limit = now() - dt.timedelta(days=KEEP_INACTIVE_DAYS)
     for path, rec in all_records():
         if path.name in seen:
@@ -321,7 +377,17 @@ def sync_requests(login: str, teams: list[str]) -> int:
             path.unlink()
             (QA_DATA_DIR / path.name).unlink(missing_ok=True)
 
-    return len(items)
+
+def sync(login: str, teams: list[str]) -> tuple[int, int]:
+    """依頼中の PR と自分の PR を探して保存データを最新にする。(依頼中の件数, 自分の PR の件数) を返す。
+
+    検索が途中で失敗したときは StepError で抜けるので、見つからなかった PR を inactive にする処理まで進まない。
+    """
+    seen: set[str] = set()
+    requested = sync_requests(login, teams, seen)
+    mine = sync_my_prs(login, seen) if MY_PRS else 0
+    deactivate_unseen(seen)
+    return requested, mine
 
 
 def qa_workdir(repo: str, number: int, sha: str) -> Path:
@@ -465,6 +531,7 @@ def prepare_workdir(work: Path, rec: dict, login: str) -> int:
         "additions": rec["additions"],
         "deletions": rec["deletions"],
         "changed_files": rec["changed_files"],
+        "role": role(rec),
         "requested_via": rec["requested_via"],
     })
     write_atomic(pr_dir / "body.md", rec["body"] or "（本文なし）")
@@ -484,9 +551,11 @@ def prepare_workdir(work: Path, rec: dict, login: str) -> int:
     if previous:
         write_json(pr_dir / "previous_review.json", {"sha": previous[-1]["sha"], "result": previous[-1]["result"]})
 
-    my_comments = fetch_my_comments(repo, number, login, rec["author"])
-    if my_comments:
-        write_json(pr_dir / "my_review_comments.json", my_comments)
+    # 自分の指摘への対応状況は、依頼された PR だけで出す（自分の PR に自分が書くのは、レビュアーへの返信のため）
+    if role(rec) == ROLE_REVIEWER:
+        my_comments = fetch_my_comments(repo, number, login, rec["author"])
+        if my_comments:
+            write_json(pr_dir / "my_review_comments.json", my_comments)
 
     rules_dir = work / "rules"
     rules_dir.mkdir(parents=True, exist_ok=True)
@@ -518,7 +587,30 @@ def extra_prompt() -> str:
     return "## 利用者ごとの追加の指示\n\n" + EXTRA_PROMPT_FILE.read_text(encoding="utf-8").strip()
 
 
-def build_prompt(mode: str, diff_lines: int, login: str) -> str:
+# 立場ごとの指示。{{ROLE}} はレビューの依頼の冒頭に、{{ROLE_RULES}} は「書き方」の末尾に入る
+ROLE_PROMPTS = {
+    ROLE_REVIEWER: {
+        "intro": "あなたは {{LOGIN}} の代わりに、{{LOGIN}} にレビュー依頼が来た 1 件の Pull Request を下読みします。",
+        "rules": "",
+    },
+    ROLE_AUTHOR: {
+        "intro": (
+            "あなたは、{{LOGIN}} が自分で作成した 1 件の Pull Request をレビューします。"
+            "レビュアーに指摘されそうな点を、レビュアーより先に本人が見つけて直すためのセルフチェックです。"
+        ),
+        "rules": (
+            "### 自分が作成した PR のとき\n\n"
+            "`pr/meta.json` の `role` が `author` なので、上の書き方のうち次の点を変える。\n\n"
+            "- `suggestion`: 本人がどう直すかを 1 文で書く。提案形式・質問形式にしなくてよい。\n"
+            "- `q`: レビュアーに意図を聞かれそうな箇所に使う。`suggestion` には、PR 本文やコードコメントに書いておくと良い説明を書く。\n"
+            "- `check_points`: レビュー依頼の前に本人が確かめておくこと（動作確認・PR 本文の不足など）を書く。\n"
+            "- `my_comments_status`: 空配列にする。"
+        ),
+    },
+}
+
+
+def build_prompt(mode: str, diff_lines: int, login: str, rec_role: str) -> str:
     if mode == "summary":
         depth = (
             "## レビューの深さ\n\n"
@@ -528,8 +620,11 @@ def build_prompt(mode: str, diff_lines: int, login: str) -> str:
         )
     else:
         depth = "## レビューの深さ\n\n差分をすべて読み、上の観点で網羅的にレビューしてください。"
+    texts = ROLE_PROMPTS[rec_role]
     return (PROMPT_FILE.read_text(encoding="utf-8")
             .replace("{{MODE}}", depth)
+            .replace("{{ROLE}}", texts["intro"])
+            .replace("{{ROLE_RULES}}", texts["rules"])
             .replace("{{LOGIN}}", login)
             .replace("{{EXTRA}}", extra_prompt()))
 
@@ -600,7 +695,7 @@ def review_one(path: Path, rec: dict, login: str) -> bool:
     try:
         diff_lines = prepare_workdir(work, rec, login)
         mode = "summary" if diff_lines > LARGE_DIFF_LINES else "full"
-        result, stats = run_claude(work, build_prompt(mode, diff_lines, login))
+        result, stats = run_claude(work, build_prompt(mode, diff_lines, login, role(rec)))
     except (StepError, OSError, tarfile.TarError, subprocess.SubprocessError, json.JSONDecodeError) as e:
         attempts = rec.setdefault("attempts", {})
         attempts[sha] = attempts.get(sha, 0) + 1
@@ -639,9 +734,9 @@ def pr_status(rec: dict) -> str:
     sha = rec["head_sha"]
     reviews = rec.get("reviews", [])
     error = rec.get("last_error")
-    if error and error.get("sha") == sha and (rec.get("rerequest_pending") or not (reviews and reviews[-1]["sha"] == sha)):
+    if error and error.get("sha") == sha and (rerequest_pending(rec) or not (reviews and reviews[-1]["sha"] == sha)):
         return "failed" if rec.get("attempts", {}).get(sha, 0) >= MAX_ATTEMPTS else "retrying"
-    if rec.get("rerequest_pending"):
+    if rerequest_pending(rec):
         return "pending_rerequest"
     if reviews and reviews[-1]["sha"] == sha:
         return "reviewed"
@@ -671,6 +766,7 @@ def render(login: str = "", teams: list[str] | None = None) -> None:
             "additions": rec.get("additions"),
             "deletions": rec.get("deletions"),
             "changed_files": rec.get("changed_files"),
+            "role": role(rec),
             "requested_via": rec.get("requested_via", []),
             "active": rec.get("active", False),
             "head_sha": rec.get("head_sha"),
@@ -690,6 +786,7 @@ def render(login: str = "", teams: list[str] | None = None) -> None:
         "org": ORG,
         "login": login,
         "teams": teams or [],
+        "my_prs": MY_PRS,
         "max_attempts": MAX_ATTEMPTS,
         "last_run": last_run,
         "prs": prs,
@@ -721,7 +818,7 @@ def redirect_output_to_log(path: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="レビュー依頼が来た PR を Claude にレビューさせ、結果を HTML に出す")
+    parser = argparse.ArgumentParser(description="レビュー依頼が来た PR と自分が作成した PR を Claude にレビューさせ、結果を HTML に出す")
     parser.add_argument("--force", action="store_true", help="曜日と時間帯（PR_REVIEW_DAYS / PR_REVIEW_HOURS）の判定を飛ばす")
     parser.add_argument("--dry-run", action="store_true", help="対象の PR を表示するだけで、レビューしない")
     parser.add_argument("--render-only", action="store_true", help="保存済みの結果から HTML だけ作り直す")
@@ -768,17 +865,19 @@ def main() -> int:
     try:
         login = my_login()
         teams = my_teams()
-        count = sync_requests(login, teams)
+        requested, mine = sync(login, teams)
         cleanup_qa_workdirs()
         pending = [(p, r) for p, r in all_records() if needs_review(r)]
         if args.only:
             pending = [(p, r) for p, r in pending if f"{r['repo']}#{r['number']}" == args.only]
-        pending.sort(key=lambda pr: (pr[1].get("first_seen_at", ""), pr[1]["number"]))
-        log(f"依頼中 {count} 件 / レビュー待ち {len(pending)} 件")
+        # 依頼された PR を先にレビューする（相手を待たせているため）。自分の PR はその後
+        pending.sort(key=lambda pr: (role(pr[1]) != ROLE_REVIEWER, pr[1].get("first_seen_at", ""), pr[1]["number"]))
+        log(f"依頼中 {requested} 件 / {f'自分の PR {mine} 件' if MY_PRS else '自分の PR は対象外'} / レビュー待ち {len(pending)} 件")
 
         if args.dry_run:
             for _, rec in pending:
-                print(f"  {rec['repo']}#{rec['number']} {rec['head_sha'][:7]} {rec['title']} ({', '.join(rec['requested_via'])})")
+                where = "自分の PR" if role(rec) == ROLE_AUTHOR else ", ".join(rec["requested_via"])
+                print(f"  {rec['repo']}#{rec['number']} {rec['head_sha'][:7]} {rec['title']} ({where})")
             render(login, teams)
             return 0
 
