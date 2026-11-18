@@ -68,6 +68,15 @@
   h1 { font-size: 20px; margin: 0 0 4px; }
   .sub { color: var(--muted); font-size: 12px; }
   .banner { margin: 12px 0; padding: 10px 12px; border-radius: 8px; background: var(--must-bg); color: var(--must); white-space: pre-wrap; }
+  .banner.info { background: var(--q-bg); color: var(--q); }
+  .banner .btn { margin-left: 8px; }
+  .head { display: flex; gap: 8px 16px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+  .runbox { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; margin-top: 4px; }
+  .run-status { font-size: 12px; color: var(--muted); }
+  .btn { font: inherit; font-size: 13px; line-height: 1.6; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 2px 12px; cursor: pointer; white-space: nowrap; }
+  .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.small { font-size: 12px; padding: 0 10px; }
   .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 16px; border-bottom: 1px solid var(--border); }
   .tab { display: inline-flex; gap: 6px; align-items: center; background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: 8px 14px; font: inherit; font-weight: 600; color: var(--muted); cursor: pointer; white-space: nowrap; }
   .tab:hover { color: var(--fg); }
@@ -106,6 +115,8 @@
   .mycomment .arrow { color: var(--accent); font-weight: 700; }
   .st-failed { background: var(--must-bg); color: var(--must); border-color: transparent; }
   .st-inactive { color: var(--muted); }
+  .st-running { background: var(--q-bg); color: var(--q); border-color: transparent; }
+  .card-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
   .risk-high { background: var(--must-bg); color: var(--must); border-color: transparent; }
   .risk-medium { background: var(--imo-bg); color: var(--imo); border-color: transparent; }
   .risk-low { background: var(--ok-bg); color: var(--ok); border-color: transparent; }
@@ -155,7 +166,7 @@
   .msg pre { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
   .msg pre code { background: none; padding: 0; word-break: normal; white-space: pre; }
   .qa-status { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .qa-status::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1s infinite alternate; }
+  .qa-status::before, .run-status.running::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1s infinite alternate; }
   @keyframes pulse { from { opacity: .3; } to { opacity: 1; } }
   .qa textarea { width: 100%; min-height: 64px; margin-top: 8px; font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; resize: vertical; }
   .qa-actions { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
@@ -169,14 +180,22 @@
   .foot { margin-top: 14px; }
   @media (max-width: 600px) {
     .card-head { flex-direction: column; }
+    .card-side { flex-direction: row; align-items: center; }
   }
 </style>
 </head>
 <body>
 <main>
-  <h1>PR 自動レビュー</h1>
-  <div class="sub" id="sub"></div>
+  <div class="head">
+    <div>
+      <h1>PR 自動レビュー</h1>
+      <div class="sub" id="sub"></div>
+    </div>
+    <!-- 今すぐ実行。server.py 経由で開いたときだけ表示する -->
+    <div class="runbox" id="runbox" hidden></div>
+  </div>
   <div id="banner"></div>
+  <div id="run-note"></div>
   <div class="tabs" id="tabs" role="tablist"></div>
   <div class="counters" id="counters"></div>
   <div class="toolbar">
@@ -190,7 +209,7 @@
 
 <!-- データは pr_review.py が埋め込む。< > & は \u 形式にエスケープ済み -->
 <script id="data" type="application/json">/*__DATA__*/null</script>
-<!-- 質問用の設定。server.py 経由で開いたときだけ埋め込まれる（ファイルを直接開いたときは null） -->
+<!-- 質問と今すぐ実行に使う設定。server.py 経由で開いたときだけ埋め込まれる（ファイルを直接開いたときは null） -->
 <script id="qa-config" type="application/json">/*__QA__*/null</script>
 <script>
 (() => {
@@ -207,8 +226,10 @@
       try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* 保存できなくても表示は続ける */ }
     },
   };
-  // 新しい push（SHA が変わる）か再依頼（requested_at が変わる）で「確認済み」が外れる
-  const confirmKey = (pr) => `prr:confirmed:${pr.repo}#${pr.number}@${pr.latest ? pr.latest.sha : ''}@${pr.requested_at || ''}`;
+  // 新しい push（SHA が変わる）か再依頼（requested_at が変わる）で「確認済み」が外れる。
+  // ボタンで同じ push をレビューし直したとき（rerun）も外す。そのときだけキーにレビューした時刻を足す
+  const confirmKey = (pr) => `prr:confirmed:${pr.repo}#${pr.number}@${pr.latest ? pr.latest.sha : ''}@${pr.requested_at || ''}` +
+    (pr.latest && pr.latest.rerun ? `@${pr.latest.reviewed_at}` : '');
   const isConfirmed = (pr) => !!pr.latest && store.get(confirmKey(pr), false);
 
   // ---- DOM ヘルパー（PR 由来の文字列は必ず textContent で入れる） ----
@@ -445,6 +466,171 @@
     );
   }
 
+  // 質問を書きかけ・答えを受け取っている途中か。このときはページを読み直さない
+  const busy = () => Object.keys(inflight).length > 0 || Object.values(drafts).some((d) => d && d.trim());
+
+  // ---- 今すぐ実行（server.py 経由で開いたときだけ使える） ----
+  // 実行の状況はサーバーに聞く。定期実行が動いている間も、ボタンは押せなくする
+  const idleRun = { running: false, target: null, progress: null, last: null };
+  let run = idleRun;
+  let runWatching = false;
+  let runRequested = false; // このページでボタンを押した。押していない実行（定期実行）が終わっても、自動では読み直さない
+  let myPid = null;         // このページのボタンで起動した pr_review.py の pid。終わった実行の結果が自分のものかを見分ける
+  let runNote = null;       // { kind: 'error' | 'info', text, reload, retry }
+  // pr_review.py の終了コード（server.py が埋め込む）。not_run: ほかの実行と重なった / not_target: 押した PR が対象から外れた
+  const EXIT = (qa && qa.exit_codes) || {};
+  const myLast = () => (myPid !== null && run.last && run.last.pid === myPid ? run.last : null);
+  const RETRY_TEXT = 'ほかの実行と重なったため、押した PR のレビューは行っていません。';
+  const runAllBtn = h('button', {
+    class: 'btn', type: 'button',
+    title: 'レビュー依頼と自分の PR を今すぐ探し直し、レビュー待ちの PR をレビューします（曜日と時間帯の設定に関係なく動きます）',
+    onclick: () => startRun(null),
+  }, '今すぐ実行');
+  const runStatus = h('span', { class: 'run-status' });
+  // 今レビューしている PR。分からなければ、ボタンで指定した PR（サーバーを再起動して target が消えていても only で分かる）
+  const runningKey = () => (run.running ? (run.progress && (run.progress.current || run.progress.only)) || run.target : null);
+  const RUN_LABEL = { reviewed: 'レビューし直す', failed: 'もう一度試す' };
+  const RUN_TITLE = {
+    reviewed: 'この PR を今すぐレビューし直します（新しい push が無くても）',
+    failed: '失敗の回数を数え直して、この PR を今すぐレビューします',
+  };
+  const hhmm = (iso) => {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  function runText() {
+    if (!run.running) return '';
+    const p = run.progress;
+    if (!p) return '実行を始めています';
+    const since = p.started_at ? `（${hhmm(p.started_at)} 開始）` : '';
+    if (p.phase === 'review') return `${p.current} をレビューしています${p.total > 1 ? ` ${p.index}/${p.total} 件目` : ''}${since}`;
+    return `PR を探しています${since}`;
+  }
+
+  // ボタン・状況の表示を、一覧を描き直さずに更新する（質問の入力欄を消さないため）
+  function updateRunUi() {
+    if (!qa) return;
+    runAllBtn.disabled = run.running;
+    runStatus.textContent = runText();
+    runStatus.title = (run.running && run.progress && run.progress.title) || '';
+    runStatus.classList.toggle('running', run.running);
+    document.getElementById('run-note').replaceChildren(...(runNote ? [h('div', { class: `banner${runNote.kind === 'error' ? '' : ' info'}` },
+      runNote.text,
+      runNote.reload ? h('button', { class: 'btn', type: 'button', onclick: () => location.reload() }, '再読み込み') : null)] : []));
+    const key = runningKey();
+    for (const b of document.querySelectorAll('[data-run-btn]')) b.disabled = run.running;
+    for (const s of document.querySelectorAll('[data-run-badge]')) s.hidden = s.dataset.runBadge !== key;
+  }
+
+  async function fetchRun() {
+    const res = await fetch('/api/run', { headers: { 'X-PRR-Token': qa.token } });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function startRun(pr) {
+    if (!qa || run.running) return;
+    runNote = null;
+    myPid = null;
+    runRequested = true;
+    run = { ...idleRun, running: true, target: pr ? prKey(pr) : null };
+    updateRunUi();
+    try {
+      const res = await fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-PRR-Token': qa.token },
+        body: JSON.stringify(pr ? { repo: pr.repo, number: pr.number } : {}),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        run = body.run;
+        myPid = body.pid;
+      } else if (res.status === 409 && body.run) {
+        // 定期実行などの途中。終わるまでボタンを押せなくする。
+        // PR を指定したときは依頼を受け付けていない（定期実行はレビュー済みの PR を飛ばす）ので、終わっても自動で読み直さず、もう一度押してもらう
+        run = body.run;
+        runNote = { kind: 'info', text: body.message, retry: !!pr };
+      } else {
+        throw new Error(body.message || `${res.status} ${res.statusText}`);
+      }
+    } catch (e) {
+      run = idleRun;
+      runRequested = false;
+      runNote = { kind: 'error', text: `実行できませんでした: ${e.message || e}` };
+      updateRunUi();
+      return;
+    }
+    updateRunUi();
+    watchRun();
+  }
+
+  // 実行が終わるまで数秒ごとに聞き、終わったらページを読み直す
+  async function watchRun() {
+    if (runWatching) return;
+    runWatching = true;
+    let failures = 0;
+    while (run.running) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      try {
+        run = await fetchRun();
+        failures = 0;
+      } catch {
+        // サーバーの再起動中などは聞き直す。再起動すると合言葉が変わるので、続けて失敗したら読み直してもらう
+        if (++failures < 10) continue;
+        run = idleRun;
+        runNote = { kind: 'error', text: 'サーバーから実行の状況を取れません（サーバーを再起動した場合は、読み直すと続きを表示します）。', reload: true };
+        break;
+      }
+      // 自分の実行が、ほかの実行（定期実行）と重なって何もせずに終わったら、そちらが終わるのを待たずに知らせる
+      const mine = myLast();
+      if (mine && mine.exit_code === EXIT.not_run && !(runNote && runNote.retry)) {
+        runNote = { kind: 'info', retry: true, text: `${RETRY_TEXT}いま動いている実行が終わってから、もう一度押してください。` };
+      }
+      updateRunUi();
+    }
+    runWatching = false;
+    if (!runNote || runNote.kind !== 'error') finishRun();
+    updateRunUi();
+  }
+
+  function finishRun() {
+    const requested = runRequested;
+    runRequested = false;
+    const mine = myLast();
+    if ((runNote && runNote.retry) || (mine && mine.exit_code === EXIT.not_run)) {
+      runNote = { kind: 'info', reload: true, text: `${RETRY_TEXT}読み直してから、もう一度ボタンを押してください。` };
+      return;
+    }
+    if (mine && mine.exit_code === EXIT.not_target) {
+      runNote = { kind: 'info', reload: true, text: '押した PR は、取得し直したらレビューの対象から外れていました（依頼が外れた・クローズしたなど）。' };
+      return;
+    }
+    if (mine && mine.exit_code !== 0) {
+      runNote = {
+        kind: 'error', reload: true,
+        text: `レビューの実行が失敗しました（終了コード ${mine.exit_code}）。ログは ~/Library/Logs/pr-review-routine/ にあります。`,
+      };
+      return;
+    }
+    // 自分で押していない実行（ページを開いたときに動いていた定期実行）では、読んでいる途中の表示を崩さないよう自動では読み直さない
+    if (!requested) {
+      runNote = { kind: 'info', text: '定期実行が終わりました。読み直すと結果を表示します。', reload: true };
+      return;
+    }
+    if (!busy()) { location.reload(); return; }
+    runNote = { kind: 'info', text: 'レビューが終わりました。読み直すと結果を表示します（書きかけの質問は消えます）。', reload: true };
+  }
+
+  function runButton(pr) {
+    if (!qa || !pr.active) return null;
+    return h('button', {
+      class: 'btn small', type: 'button', 'data-run-btn': '', disabled: run.running,
+      title: RUN_TITLE[pr.status] || 'この PR だけを今すぐレビューします',
+      onclick: () => startRun(pr),
+    }, RUN_LABEL[pr.status] || '今すぐレビュー');
+  }
+
   const MY_STATUS = ['not_fixed', 'partial', 'unclear', 'replied', 'fixed'];
   const MY_STATUS_LABEL = { not_fixed: '未対応', partial: '一部対応', unclear: '判断できない', replied: '返信で回答', fixed: '対応済み' };
 
@@ -452,10 +638,16 @@
   const lastRun = data.last_run;
   document.getElementById('sub').textContent =
     `最終更新 ${fmt(data.generated_at)}` +
-    (lastRun ? ` ／ 最終実行 ${fmt(lastRun.finished_at)}（${lastRun.ok ? '成功' : '失敗'}・レビュー ${lastRun.reviewed} 件）` : '') +
+    (lastRun ? ` ／ 最終実行 ${fmt(lastRun.finished_at)}（${lastRun.ok ? '成功' : '失敗'}・レビュー ${lastRun.reviewed} 件` +
+      `${lastRun.failed ? `・失敗 ${lastRun.failed} 件` : ''}）` : '') +
     (data.login ? ` ／ ${data.login}` : '');
   if (lastRun && !lastRun.ok) {
     document.getElementById('banner').append(h('div', { class: 'banner', text: `前回の実行が失敗しました: ${lastRun.message}` }));
+  }
+  if (qa) {
+    const box = document.getElementById('runbox');
+    box.append(runStatus, runAllBtn);
+    box.hidden = false;
   }
 
   // ---- タブ ----
@@ -582,7 +774,8 @@
       (r.check_points || []).length ? h('div', { class: 'section' }, h('h3', { text: '確認ポイント' }), bullets(r.check_points)) : null,
       (r.good_points || []).length ? h('div', { class: 'section' }, h('h3', { text: '良い点' }), bullets(r.good_points)) : null,
       r.changes_since_previous ? h('div', { class: 'section' }, h('h3', { text: '前回のレビューからの変化' }), h('div', {}, rich(r.changes_since_previous))) : null,
-      h('div', { class: 'sub foot', text: `${fmt(review.reviewed_at)} に ${review.sha.slice(0, 7)} をレビュー（${review.mode === 'summary' ? `差分 ${review.diff_lines} 行のため要約中心` : '全体'}）` }),
+      h('div', { class: 'sub foot', text: `${fmt(review.reviewed_at)} に ${review.sha.slice(0, 7)} をレビュー（${review.mode === 'summary' ? `差分 ${review.diff_lines} 行のため要約中心` : '全体'}` +
+        `${review.rerun ? '・ボタンでレビューし直し' : ''}）` }),
     );
   }
 
@@ -606,12 +799,14 @@
     checkbox.checked = confirmed;
     checkbox.addEventListener('change', () => { store.set(confirmKey(pr), checkbox.checked); render(); });
 
+    const key = prKey(pr);
     const head = h('div', { class: 'card-head' },
       h('div', {},
         h('div', { class: 'title' },
           h('span', { class: 'num', text: `${pr.repo} #${pr.number}` }),
           url ? h('a', { href: url, target: '_blank', rel: 'noopener', text: pr.title }) : pr.title),
         h('div', { class: 'meta' },
+          h('span', { class: 'badge st-running', 'data-run-badge': key, hidden: runningKey() !== key, text: 'レビュー中' }),
           h('span', { class: `badge st-${pr.status}`, text: statusLabel(pr) }),
           pr.draft ? h('span', { class: 'badge', text: 'draft' }) : null,
           pr.rerequest_count > 0 ? h('span', { class: 'badge rereq', text: `再依頼 ${fmt(pr.requested_at)}` }) : null,
@@ -620,12 +815,18 @@
           h('span', { text: `→ ${pr.base}` }),
           h('span', { text: `+${pr.additions} / −${pr.deletions}（${pr.changed_files} ファイル）` }),
         )),
-      pr.latest ? h('label', { class: 'confirm' }, checkbox, '確認済み') : null,
+      h('div', { class: 'card-side' },
+        pr.latest ? h('label', { class: 'confirm' }, checkbox, '確認済み') : null,
+        runButton(pr)),
     );
 
     const parts = [head];
-    if (pr.last_error && (pr.status === 'retrying' || pr.status === 'failed')) {
-      parts.push(h('div', { class: 'error', text: `${fmt(pr.last_error.at)} 失敗（${pr.last_error.attempts}/${data.max_attempts} 回目）: ${pr.last_error.message}` }));
+    const err = pr.last_error;
+    if (err && (pr.status === 'retrying' || pr.status === 'failed')) {
+      parts.push(h('div', { class: 'error', text: `${fmt(err.at)} 失敗（${err.attempts}/${data.max_attempts} 回目）: ${err.message}` }));
+    } else if (err && pr.status === 'reviewed' && err.sha === pr.latest.sha && new Date(err.at) > new Date(pr.latest.reviewed_at)) {
+      // レビュー済みの push をボタンでレビューし直して失敗した。自動ではやり直さない
+      parts.push(h('div', { class: 'error', text: `${fmt(err.at)} レビューし直しに失敗しました（表示は前の結果です）: ${err.message}` }));
     }
     if (pr.latest) {
       const details = h('details', {},
@@ -638,7 +839,6 @@
           pr.older.map((rv) => h('div', { class: 'older' }, reviewBody(pr, rv)))) : null,
       );
       // 未確認のものは最初から開いておき、確認済みは畳む。自分で開け閉めしたらそれを保つ
-      const key = prKey(pr);
       details.open = detailsOpen[key] ?? (!confirmed && pr.active);
       details.addEventListener('toggle', () => { detailsOpen[key] = details.open; });
       parts.push(details);
@@ -683,12 +883,20 @@
   if (location.hash === '#qa') data.prs.forEach((pr) => openQa.add(prKey(pr)));
   render();
   loadConversations().then(render);
+  // 開いたときに実行中（定期実行を含む）なら、ボタンを押せなくし、終わったら読み直す
+  if (qa) {
+    fetchRun().then((state) => {
+      run = state;
+      updateRunUi();
+      if (run.running) watchRun();
+    }).catch(() => { /* 取れなくてもボタンは使える */ });
+  }
 
   // ファイルは定期的に作り直されるので、タブに戻ってきたときに読み直す。
-  // 答えを受け取っている途中や、質問を書きかけのときは読み直さない
+  // 答えを受け取っている途中・質問を書きかけ・レビューの実行中・実行についての案内を出しているときは読み直さない
+  // （実行中に読み直すと、自分が押した実行の結果を見分けられなくなるため）
   document.addEventListener('visibilitychange', () => {
-    const busy = Object.keys(inflight).length > 0 || Object.values(drafts).some((d) => d && d.trim());
-    if (!document.hidden && !busy && Date.now() - loadedAt > 60 * 1000) location.reload();
+    if (!document.hidden && !busy() && !run.running && !runNote && Date.now() - loadedAt > 60 * 1000) location.reload();
   });
 })();
 </script>

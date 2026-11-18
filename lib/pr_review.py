@@ -73,6 +73,8 @@ DATA_DIR = ROOT / "data"
 REVIEWS_DIR = DATA_DIR / "reviews"
 LAST_RUN_FILE = DATA_DIR / "last_run.json"
 LOCK_FILE = DATA_DIR / ".lock"
+# 実行中の進み具合（どの PR をレビューしているか）。server.py が読んでページに出す。実行が終わったら消す
+RUN_STATUS_FILE = DATA_DIR / "run_status.json"
 QA_DATA_DIR = DATA_DIR / "qa"  # ページからの質問の会話（server.py が書く）
 OUT_HTML = ROOT / "out" / "index.html"
 # claude が中を読む作業ディレクトリ。macOS のプライバシー保護（TCC）の対象外の場所に置く。
@@ -94,6 +96,9 @@ MODEL = os.environ.get("PR_REVIEW_MODEL", "")
 EFFORT = os.environ.get("PR_REVIEW_EFFORT", "")
 MAX_ATTEMPTS = 3
 KEEP_REVIEW_VERSIONS = 5
+# --again（ページのボタンでの PR 指定）を行わなかったときの終了コード。server.py がページに渡し、ページが案内を出す
+EXIT_NOT_RUN = 75  # ほかの実行がロックを持っていた（EX_TEMPFAIL）
+EXIT_NOT_TARGET = 66  # 取得し直したら、指定した PR がレビューの対象から外れていた（EX_NOINPUT）
 KEEP_INACTIVE_DAYS = 30
 # レビュー観点のファイル（「:」区切り）。毎回作業ディレクトリの rules/ にコピーして渡す
 # （レビューする Claude は作業ディレクトリの外を読めないため）
@@ -510,8 +515,8 @@ def extract_tarball(repo: str, sha: str, dest: Path) -> None:
     archive.unlink()
 
 
-def prepare_workdir(work: Path, rec: dict, login: str) -> int:
-    """レビュー用の作業ディレクトリを作る。差分の行数を返す。"""
+def prepare_workdir(work: Path, rec: dict, login: str, *, rerun: bool = False) -> int:
+    """レビュー用の作業ディレクトリを作る。差分の行数を返す。rerun は review_one と同じ。"""
     repo, number = rec["repo"], rec["number"]
     base_sha, head_sha = rec["base_sha"], rec["head_sha"]
 
@@ -548,6 +553,10 @@ def prepare_workdir(work: Path, rec: dict, login: str) -> int:
     write_atomic(pr_dir / "diff.patch", diff)
 
     previous = rec.get("reviews", [])
+    if rerun:
+        # 同じ push をレビューし直すときは、その push の前回の結果を渡さない（引きずられず、新しい目で見てもらうため）。
+        # 前の push のレビューがあれば、それを「前回」として渡す
+        previous = [r for r in previous if r["sha"] != head_sha]
     if previous:
         write_json(pr_dir / "previous_review.json", {"sha": previous[-1]["sha"], "result": previous[-1]["result"]})
 
@@ -684,7 +693,8 @@ def run_claude(work: Path, prompt: str) -> tuple[dict, dict]:
     return result, stats
 
 
-def review_one(path: Path, rec: dict, login: str) -> bool:
+def review_one(path: Path, rec: dict, login: str, *, rerun: bool = False) -> bool:
+    """1 件をレビューする。rerun は、レビュー済みの push をページのボタンでレビューし直すとき。"""
     repo, number, sha = rec["repo"], rec["number"], rec["head_sha"]
     work = WORK_DIR / f"{repo}__{number}__{sha[:12]}"
     if work.exists():
@@ -693,7 +703,7 @@ def review_one(path: Path, rec: dict, login: str) -> bool:
     log(f"レビュー開始: {repo}#{number} ({sha[:7]}) {rec['title']}")
 
     try:
-        diff_lines = prepare_workdir(work, rec, login)
+        diff_lines = prepare_workdir(work, rec, login, rerun=rerun)
         mode = "summary" if diff_lines > LARGE_DIFF_LINES else "full"
         result, stats = run_claude(work, build_prompt(mode, diff_lines, login, role(rec)))
     except (StepError, OSError, tarfile.TarError, subprocess.SubprocessError, json.JSONDecodeError) as e:
@@ -706,14 +716,22 @@ def review_one(path: Path, rec: dict, login: str) -> bool:
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
-    rec.setdefault("reviews", []).append({
+    review = {
         "sha": sha,
         "reviewed_at": now_iso(),
         "mode": mode,
         "diff_lines": diff_lines,
         "stats": stats,
         "result": result,
-    })
+    }
+    reviews = rec.get("reviews", [])
+    if rerun:
+        # ページは、これを見て「確認済み」を外す（同じ push なので SHA では見分けられない）
+        review["rerun"] = True
+        # 同じ push を何度レビューし直しても、前の push のレビューが履歴から押し出されないよう、
+        # その push の以前のレビューし直し分は置き換える（最初のレビューは残す）
+        reviews = [r for r in reviews if not (r["sha"] == sha and r.get("rerun"))]
+    rec["reviews"] = reviews + [review]
     rec["reviews"] = rec["reviews"][-KEEP_REVIEW_VERSIONS:]
     rec["last_error"] = None
     rec["rerequest_pending"] = False
@@ -824,8 +842,13 @@ def main() -> int:
     parser.add_argument("--render-only", action="store_true", help="保存済みの結果から HTML だけ作り直す")
     parser.add_argument("--limit", type=int, default=MAX_PER_RUN, help=f"1 回でレビューする最大件数（既定 {MAX_PER_RUN}）")
     parser.add_argument("--only", help="この PR だけレビューする（例: my-repo#123）")
-    parser.add_argument("--launchd", action="store_true", help="launchd から起動したとき用。出力を日付ごとのログファイルに書く")
+    parser.add_argument("--again", action="store_true",
+                        help="--only と一緒に使う。レビュー済みの PR や、失敗の上限に達した PR もレビューし直す（ページの「今すぐレビュー」）")
+    parser.add_argument("--launchd", action="store_true",
+                        help="launchd（と server.py）から起動したとき用。出力を日付ごとのログファイルに書く")
     args = parser.parse_args()
+    if args.again and not args.only:
+        parser.error("--again は --only と一緒に指定してください")
 
     if args.launchd:
         redirect_output_to_log(LOG_DIR / f"{now():%Y%m%d}.log")
@@ -845,7 +868,12 @@ def main() -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         log("前回の実行が終わっていないため、今回は何もしません")
-        return 0
+        # ページのボタンからの PR 指定（--again）は、定期実行と重なると行われない。
+        # それをサーバー経由でページに伝えるため、失敗とは別の終了コードにする
+        return EXIT_NOT_RUN if args.again else 0
+
+    # 前回の実行が強制終了されていると、進み具合のファイルが残っている。ページに古い状況を出さないよう消す
+    RUN_STATUS_FILE.unlink(missing_ok=True)
 
     if args.render_only:
         render()
@@ -860,6 +888,20 @@ def main() -> int:
         shutil.rmtree(leftover, ignore_errors=True)
 
     started = now_iso()
+    try:
+        return run_once(args, started)
+    finally:
+        RUN_STATUS_FILE.unlink(missing_ok=True)
+
+
+def write_progress(started: str, only: str | None, **fields: object) -> None:
+    """実行の進み具合を書く。定期実行・ページのボタンからの実行のどちらでも、server.py がこれをページに出す。"""
+    write_json(RUN_STATUS_FILE, {"started_at": started, "only": only, **fields})
+
+
+def run_once(args: argparse.Namespace, started: str) -> int:
+    """1 回分の取得 → レビュー → 生成。ロックを取ったあとに main から呼ぶ。"""
+    write_progress(started, args.only, phase="sync")
     login, teams = "", []
     reviewed = failed = 0
     try:
@@ -867,9 +909,15 @@ def main() -> int:
         teams = my_teams()
         requested, mine = sync(login, teams)
         cleanup_qa_workdirs()
-        pending = [(p, r) for p, r in all_records() if needs_review(r)]
         if args.only:
-            pending = [(p, r) for p, r in pending if f"{r['repo']}#{r['number']}" == args.only]
+            # --again なら、レビュー済みの PR や、失敗の上限に達した PR もレビューし直す（ページの「今すぐレビュー」）
+            pending = [(p, r) for p, r in all_records()
+                       if f"{r['repo']}#{r['number']}" == args.only
+                       and (needs_review(r) or (args.again and r.get("active")))]
+            if not pending:
+                log(f"{args.only} はレビューの対象ではありません（依頼が外れた・クローズした・レビュー済みなど）")
+        else:
+            pending = [(p, r) for p, r in all_records() if needs_review(r)]
         # 依頼された PR を先にレビューする（相手を待たせているため）。自分の PR はその後
         pending.sort(key=lambda pr: (role(pr[1]) != ROLE_REVIEWER, pr[1].get("first_seen_at", ""), pr[1]["number"]))
         log(f"依頼中 {requested} 件 / {f'自分の PR {mine} 件' if MY_PRS else '自分の PR は対象外'} / レビュー待ち {len(pending)} 件")
@@ -881,8 +929,18 @@ def main() -> int:
             render(login, teams)
             return 0
 
-        for path, rec in pending[: max(args.limit, 0)]:
-            if review_one(path, rec, login):
+        targets = pending[: max(args.limit, 0)]
+        for i, (path, rec) in enumerate(targets, 1):
+            write_progress(started, args.only, phase="review", current=f"{rec['repo']}#{rec['number']}",
+                           title=rec.get("title", ""), index=i, total=len(targets))
+            rerun = False
+            if args.again:
+                # 失敗の上限に達していても、回数を数え直してレビューする
+                rec["attempts"] = {}
+                # 定期実行でもレビューする状態（レビュー待ち・再依頼・失敗）なら、定期実行と同じに扱う。
+                # 定期実行では飛ばす、レビュー済みの push をやり直すときだけ「レビューし直し」にする
+                rerun = not needs_review(rec)
+            if review_one(path, rec, login, rerun=rerun):
                 reviewed += 1
             else:
                 failed += 1
@@ -898,7 +956,8 @@ def main() -> int:
                                "message": "", "reviewed": reviewed, "failed": failed})
     render(login, teams)
     log(f"実行完了: レビュー {reviewed} 件 / 失敗 {failed} 件")
-    return 0
+    # ボタンで指定した PR が、取得し直した結果レビューの対象から外れていた（依頼が外れた・クローズした）
+    return EXIT_NOT_TARGET if args.again and not targets else 0
 
 
 if __name__ == "__main__":
