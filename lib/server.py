@@ -5,7 +5,8 @@
   GET  /api/qa    保存済みの会話を返す
   POST /api/ask   質問を受け取り、Claude の答えを 1 行 1 件の JSON で流しながら返す
   GET  /api/run   レビューの実行状況（定期実行・ボタンからの実行のどちらでも）を返す
-  POST /api/run   レビューを今すぐ実行する（pr_review.py を起動する）。PR を指定すると、その PR だけをレビューし直す
+  POST /api/run   レビューを今すぐ実行する（pr_review.py を起動する）。PR を指定するとその PR だけを、URL なら一覧に無い PR も個別にレビューする
+  POST /api/remove 個別にレビューした PR を一覧から外す
 
 守り:
   - 127.0.0.1 にだけ bind する。ほかのマシンからは繋がらない
@@ -190,21 +191,23 @@ def run_state() -> dict:
     return {"running": running, "target": target, "progress": progress, "last": last}
 
 
-def start_run(rec: dict | None) -> int | None:
+def start_run(target: str | None, *, add: bool = False) -> int | None:
     """pr_review.py を起動し、その pid を返す。すでに実行中なら起動せずに None を返す。
 
-    曜日と時間帯の設定に関係なく動かす（--force）。PR を指定したら、その PR だけを、
+    曜日と時間帯の設定に関係なく動かす（--force）。target（<repo>#<番号>）を指定したら、その PR だけを、
     レビュー済みや失敗の上限に達していてもレビューし直す（--only --again）。
+    add なら、一覧に無い PR を個別にレビューする PR として足してからレビューする（--add）。
     """
     global _run_proc, _run_target
     with _run_guard:
         if _run_proc is not None or review_locked():
             return None
-        target = f"{rec['repo']}#{rec['number']}" if rec else None
         # 出力は pr_review.py が日付ごとのログに書く（--launchd）。定期実行と同じ場所で見られるようにするため
         cmd = [sys.executable, str(REVIEW_SCRIPT), "--force", "--launchd"]
-        if target:
-            # = でつなぐ。値が - で始まっても、オプションと取り違えられないようにするため
+        # = でつなぐ。値が - で始まっても、オプションと取り違えられないようにするため
+        if target and add:
+            cmd += [f"--add={target}"]
+        elif target:
             cmd += [f"--only={target}", "--again"]
         # 別のセッションで起動する。レビューの途中でサーバーを再起動しても、レビューは最後まで行う
         proc = subprocess.Popen(cmd, cwd=m.ROOT, env=BASE_ENV, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -222,6 +225,44 @@ def wait_run(proc: subprocess.Popen, target: str | None) -> None:
         # pid はページが「自分が押した実行の結果か」を見分けるために使う
         _run_last = {"pid": proc.pid, "target": target, "exit_code": code, "finished_at": m.now_iso()}
     m.log(f"今すぐ実行が終わりました: {target or 'すべて'} (exit={code})")
+
+
+def remove_manual(repo: str, number: int) -> str:
+    """個別に頼んだ PR を一覧から外す（記録・質問の会話・質問用の作業ディレクトリを消す）。
+
+    結果を "ok" / "busy"（レビューの実行中か、この PR の質問に答えている途中）/ "missing" / "not_manual" で返す。
+    実行中の pr_review.py や質問への回答は記録や会話を書き戻すので、外したものが戻ってこないよう、
+    どちらのロックも取ってから、記録を読み直して立場を確かめて消す。
+    """
+    me = login()  # 初回は gh を呼ぶので、ロックを取る前に済ませる（その間ほかの問い合わせを止めないため）
+    qa_lock = pr_lock(f"{repo}#{number}")
+    if not qa_lock.acquire(blocking=False):
+        return "busy"
+    try:
+        with _run_guard:
+            if _run_proc is not None:
+                return "busy"
+            m.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with m.LOCK_FILE.open("a") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return "busy"
+                path = m.record_path(repo, number)
+                if not path.exists():
+                    return "missing"
+                # 確かめてからロックを取るまでに、定期実行が依頼された PR に変えていることがある
+                if m.role(m.load_record(path)) != m.ROLE_MANUAL:
+                    return "not_manual"
+                path.unlink()
+                qa_path(repo, number).unlink(missing_ok=True)
+                for work in m.QA_WORK_DIR.glob(f"{repo}__{number}__*"):
+                    shutil.rmtree(work, ignore_errors=True)
+                m.render(me)  # ファイルで直接開いたときも、外したものが出ないようにする
+    finally:
+        qa_lock.release()
+    m.log(f"個別レビューから外しました: {repo}#{number}")
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -312,26 +353,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.handle_ask()
         if self.path == "/api/run":
             return self.handle_run()
+        if self.path == "/api/remove":
+            return self.handle_remove()
         return self.send_text(404, "not found")
 
+    def find_record(self, repo: str, number: int) -> dict | None:
+        """記録を読む。repo 名にパス区切りなどが入っていたり、記録が無かったりしたら None。"""
+        path = m.record_path(repo, number)
+        if path.parent != m.REVIEWS_DIR or not path.exists():
+            return None
+        return m.load_record(path)
+
     def handle_run(self) -> None:
-        """PR を指定しなければ定期実行と同じことを今すぐ行い、指定すればその PR だけをレビューし直す。"""
+        """今すぐレビューする。指定が無ければ定期実行と同じこと、repo と number ならその PR だけ、
+        url（PR の URL）なら、一覧に無い PR も個別にレビューする PR として足してレビューする。"""
+        bad_request = {"message": "リクエストの形が正しくありません"}
         try:
             req = self.read_json()
-            target = (str(req["repo"]), int(req["number"])) if "repo" in req else None
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-            return self.send_json(400, {"message": "リクエストの形が正しくありません"})
-        rec = None
-        if target:
-            path = m.record_path(*target)
-            # repo 名にパス区切りなどが入っていないこと・記録があることを確かめる
-            if path.parent != m.REVIEWS_DIR or not path.exists():
+        except ValueError:  # json.JSONDecodeError も含む
+            return self.send_json(400, bad_request)
+        if "url" in req:
+            try:
+                target = m.parse_pr_ref(str(req["url"]))
+            except ValueError as e:
+                return self.send_json(400, {"message": str(e)})  # そのまま読める説明になっている
+        elif "repo" in req:
+            try:
+                target = (str(req["repo"]), int(req["number"]))
+            except (ValueError, KeyError, TypeError):
+                return self.send_json(400, bad_request)
+        else:
+            target = None
+        # URL のときは、一覧にあるかどうかに関係なく --add で起動する。pr_review.py が GitHub から取り直した状態で
+        # 立場を決める（依頼中・自分の PR ならその扱いのまま、無い・外れた PR は個別レビューとして足す）。
+        # サーバーが持っている記録は古いことがあり（依頼が外れた直後など）、それで決めると対象外として終わってしまう
+        add = "url" in req
+        if target and not add:
+            rec = self.find_record(*target)
+            if rec is None:
                 return self.send_json(404, {"message": "この PR の記録がありません"})
-            rec = m.load_record(path)
             if not rec.get("active"):
                 return self.send_json(409, {"message": "依頼が外れた PR・クローズした PR はレビューしません"})
+        name = f"{target[0]}#{target[1]}" if target else None
         try:
-            pid = start_run(rec)
+            pid = start_run(name, add=add)
         except OSError as e:
             m.log(f"今すぐ実行を起動できませんでした: {e}")
             return self.send_json(500, {"message": f"起動できませんでした: {e}"})
@@ -339,9 +404,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # PR を指定したときは、実行中のほうがその PR をレビューし直すとは限らない（定期実行は、レビュー済みの PR を飛ばす）。
             # 依頼を受け付けなかったことをはっきり伝える
             message = ("レビューの実行中のため、この PR のレビューは受け付けませんでした。終わってからもう一度押してください"
-                       if rec else "レビューの実行中です。終わったら結果を読み込みます")
+                       if target else "レビューの実行中です。終わったら結果を読み込みます")
             return self.send_json(409, {"message": message, "run": run_state()})
         return self.send_json(202, {"run": run_state(), "pid": pid})
+
+    def handle_remove(self) -> None:
+        """個別に頼んだ PR を一覧から外す。依頼された PR・自分の PR は、GitHub の状態で決まるので外さない。"""
+        try:
+            req = self.read_json()
+            rec = self.find_record(str(req["repo"]), int(req["number"]))
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return self.send_json(400, {"message": "リクエストの形が正しくありません"})
+        if rec is None:
+            return self.send_json(404, {"message": "この PR の記録がありません"})
+        try:
+            result = remove_manual(rec["repo"], rec["number"])
+        except (m.StepError, OSError) as e:
+            m.log(f"個別レビューから外せませんでした: {rec['repo']}#{rec['number']}: {e}")
+            return self.send_json(500, {"message": f"外せませんでした: {e}"})
+        if result == "missing":
+            return self.send_json(404, {"message": "この PR の記録がありません"})
+        if result == "not_manual":
+            return self.send_json(409, {"message": "一覧から外せるのは、URL を貼って個別にレビューした PR だけです"})
+        if result == "busy":
+            return self.send_json(409, {"message": "レビューの実行中か、この PR の質問に答えている途中です。終わってからもう一度押してください"})
+        return self.send_json(200, {"removed": f"{rec['repo']}#{rec['number']}"})
 
     def handle_ask(self) -> None:
         try:
@@ -352,13 +439,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not question or len(question) > MAX_QUESTION_CHARS:
             return self.send_text(400, f"質問は 1〜{MAX_QUESTION_CHARS} 文字で入力してください")
 
-        path = m.record_path(repo, number)
-        # repo 名にパス区切りなどが入っていないこと・記録があることを確かめる（記録の無い PR には答えない）
-        if path.parent != m.REVIEWS_DIR or not path.exists():
+        rec = self.find_record(repo, number)
+        if rec is None:  # 記録の無い PR には答えない
             return self.send_text(404, "この PR の記録がありません")
-        rec = m.load_record(path)
 
-        lock = pr_lock(f"{repo}#{number}")
+        # 一覧から外す処理と同じキーで排他する（記録の正式なリポジトリ名を使う）
+        lock = pr_lock(f"{rec['repo']}#{rec['number']}")
         if not lock.acquire(blocking=False):
             return self.send_text(409, "この PR への前の質問に答えている途中です")
         try:

@@ -20,6 +20,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -108,9 +109,18 @@ EXTRA_PROMPT_FILE = config_path(os.environ["PR_REVIEW_EXTRA_PROMPT"]) if os.envi
 # 自分が作成したオープン中の PR もレビューするか（既定はする。draft も含める）
 MY_PRS = os.environ.get("PR_REVIEW_MY_PRS", "1").strip().lower() not in ("0", "false", "no", "off")
 
-# PR ごとの記録が、どちらの立場で見つけたものか
+# PR ごとの記録が、どの立場で見つけたものか
 ROLE_REVIEWER = "reviewer"  # 自分か所属チームにレビュー依頼が来た PR
 ROLE_AUTHOR = "author"  # 自分が作成した PR
+ROLE_MANUAL = "manual"  # ページに URL を貼って、個別にレビューを頼んだ PR（依頼も来ておらず、自分の PR でもない）
+
+# 個別にレビューを頼むときに受け付ける PR の書き方
+PR_REF_PATTERNS = [
+    # https://github.com/<org>/<repo>/pull/<番号>（後ろに /files や #... が付いていてもよい）
+    re.compile(r"^https://github\.com/(?P<org>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9._-]+)/pull/(?P<number>[0-9]+)(?:[/?#].*)?$"),
+    # <repo>#<番号> か <org>/<repo>#<番号>
+    re.compile(r"^(?:(?P<org>[A-Za-z0-9-]+)/)?(?P<repo>[A-Za-z0-9._-]+)#(?P<number>[0-9]+)$"),
+]
 
 # 自動で動く曜日と時間帯（Mac のタイムゾーン）
 #   曜日: 1 = 月曜 〜 7 = 日曜。「1-5」なら月〜金
@@ -217,6 +227,22 @@ def role(rec: dict) -> str:
     return rec.get("role", ROLE_REVIEWER)
 
 
+def parse_pr_ref(text: str) -> tuple[str, int]:
+    """PR の URL か <repo>#<番号> を (repo, 番号) にする。設定した organization の PR でなければ ValueError。"""
+    text = text.strip()
+    for pattern in PR_REF_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        org, repo, number = match.group("org"), match.group("repo"), int(match.group("number"))
+        if org and org.lower() != ORG.lower():
+            raise ValueError(f"{ORG} の PR ではありません（{org}）。対象は設定した organization の PR だけです")
+        if repo in (".", "..") or number <= 0:
+            break
+        return repo, number
+    raise ValueError(f"PR の URL（https://github.com/{ORG}/<リポジトリ>/pull/<番号>）を入力してください")
+
+
 def rerequest_pending(rec: dict) -> bool:
     """再依頼されて、まだレビューし直していないか。自分の PR には再依頼が無い。"""
     return role(rec) == ROLE_REVIEWER and bool(rec.get("rerequest_pending"))
@@ -228,6 +254,9 @@ def needs_review(rec: dict) -> bool:
     sha = rec["head_sha"]
     if rec.get("attempts", {}).get(sha, 0) >= MAX_ATTEMPTS:
         return False
+    if role(rec) == ROLE_MANUAL:
+        # 個別に頼んだ PR は、最初の 1 回だけ自動でレビューする。新しい push は、ページのボタンで頼まれたときだけ（利用枠を勝手に使わない）
+        return not rec.get("reviews")
     # 再依頼されたら、push が無くても自分の指摘への対応状況を出すためにレビューし直す
     if rerequest_pending(rec):
         return True
@@ -323,6 +352,9 @@ def sync_requests(login: str, teams: list[str], seen: set[str]) -> int:
         path = record_path(repo, number)
         existed = path.exists()
         rec = load_record(path) if existed else new_record(repo, number, ROLE_REVIEWER)
+        if existed and role(rec) == ROLE_MANUAL:
+            # 個別に頼んでいた PR に、正式に依頼が来た。「確認済み」を外して目に入るようにする
+            rec["requested_at"] = now_iso()
         rec["role"] = ROLE_REVIEWER
         # my_last_review_at を持たない古い記録は、初めて見た扱いにする（再依頼とは判定しない）
         known = existed and "my_last_review_at" in rec
@@ -368,6 +400,65 @@ def sync_my_prs(login: str, seen: set[str]) -> int:
     return len(found)
 
 
+def sync_manual(seen: set[str]) -> int:
+    """個別に頼んだ PR を GitHub から取り直す。オープン中のものを seen に足し、その件数を返す。
+
+    クローズ・マージされたものは seen に足さないので、deactivate_unseen が inactive にする。
+    依頼された PR・自分の PR として見つかったものは、そちらの扱いになっている（seen に入っている）ので飛ばす。
+    """
+    count = 0
+    for path, rec in all_records():
+        if path.name in seen or role(rec) != ROLE_MANUAL or not rec.get("active"):
+            continue
+        try:
+            pr = gh_json(f"repos/{ORG}/{rec['repo']}/pulls/{rec['number']}")
+        except StepError as e:
+            # 取れなかった（読む権限が外れた・一時的な失敗など）。この回は今の状態のまま残し、ほかの PR の処理は続ける
+            log(f"個別に頼んだ PR を取れませんでした: {rec['repo']}#{rec['number']}: {e}")
+            seen.add(path.name)
+            continue
+        if pr.get("state") != "open":
+            continue
+        apply_pr(rec, pr)
+        write_json(path, rec)
+        seen.add(path.name)
+        count += 1
+    return count
+
+
+def add_manual(repo: str, number: int) -> str | None:
+    """URL を貼って頼まれた PR を記録に足し、その PR を <repo>#<番号> で返す。
+    見つからない・オープン中でないときは足さずに None を返す。
+
+    依頼された PR・自分の PR としてすでに一覧にあるものは、その扱いのまま（立場を変えない）。
+    依頼が外れた PR やクローズした PR の記録があれば、個別に頼んだ PR として有効にし直す。
+    """
+    try:
+        pr = gh_json(f"repos/{ORG}/{repo}/pulls/{number}")
+    except StepError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        # 番号の誤り・Issue の番号・読む権限が無いなど。実行の失敗にはしない（ページ上部に失敗が出続けるため）
+        log(f"{repo}#{number} は見つかりませんでした（番号の誤り・Issue の番号・読む権限が無いなど）")
+        return None
+    if pr.get("state") != "open":
+        log(f"{repo}#{number} はオープン中ではないため、個別レビューに足しません（{pr.get('state')}）")
+        return None
+    # GitHub はリポジトリ名の大文字小文字を区別しない。記録は検索結果と同じ正式な名前で持つ
+    # （入力どおりの名前で持つと、後から依頼が来たときに検索結果と同じ PR だと分からなくなる）
+    repo = pr["base"]["repo"]["name"]
+    path = record_path(repo, number)
+    rec = load_record(path) if path.exists() else new_record(repo, number, ROLE_MANUAL)
+    if not rec.get("active"):
+        # 依頼された PR だったときの再依頼の情報は引き継がない（個別レビューのカードに「再依頼」が出ないように）
+        rec.update({"role": ROLE_MANUAL, "requested_via": [], "requested_at": now_iso(),
+                    "rerequest_count": 0, "rerequest_pending": False})
+    apply_pr(rec, pr)
+    write_json(path, rec)
+    log(f"個別レビューに足しました: {repo}#{number}（{role(rec)}）")
+    return f"{repo}#{number}"
+
+
 def deactivate_unseen(seen: set[str]) -> None:
     """今回見つからなかった PR（依頼が外れた・クローズした）を inactive にし、外れてから日が経ったものは消す。"""
     limit = now() - dt.timedelta(days=KEEP_INACTIVE_DAYS)
@@ -383,16 +474,17 @@ def deactivate_unseen(seen: set[str]) -> None:
             (QA_DATA_DIR / path.name).unlink(missing_ok=True)
 
 
-def sync(login: str, teams: list[str]) -> tuple[int, int]:
-    """依頼中の PR と自分の PR を探して保存データを最新にする。(依頼中の件数, 自分の PR の件数) を返す。
+def sync(login: str, teams: list[str]) -> tuple[int, int, int]:
+    """依頼中の PR・自分の PR・個別に頼んだ PR を取り直して保存データを最新にする。それぞれの件数を返す。
 
     検索が途中で失敗したときは StepError で抜けるので、見つからなかった PR を inactive にする処理まで進まない。
     """
     seen: set[str] = set()
     requested = sync_requests(login, teams, seen)
     mine = sync_my_prs(login, seen) if MY_PRS else 0
+    manual = sync_manual(seen)
     deactivate_unseen(seen)
-    return requested, mine
+    return requested, mine, manual
 
 
 def qa_workdir(repo: str, number: int, sha: str) -> Path:
@@ -560,8 +652,9 @@ def prepare_workdir(work: Path, rec: dict, login: str, *, rerun: bool = False) -
     if previous:
         write_json(pr_dir / "previous_review.json", {"sha": previous[-1]["sha"], "result": previous[-1]["result"]})
 
-    # 自分の指摘への対応状況は、依頼された PR だけで出す（自分の PR に自分が書くのは、レビュアーへの返信のため）
-    if role(rec) == ROLE_REVIEWER:
+    # 自分の指摘への対応状況は、ほかの人の PR（依頼された PR・個別に頼んだ PR）だけで出す
+    # （自分の PR に自分が書くのは、レビュアーへの返信のため）
+    if role(rec) != ROLE_AUTHOR:
         my_comments = fetch_my_comments(repo, number, login, rec["author"])
         if my_comments:
             write_json(pr_dir / "my_review_comments.json", my_comments)
@@ -600,6 +693,11 @@ def extra_prompt() -> str:
 ROLE_PROMPTS = {
     ROLE_REVIEWER: {
         "intro": "あなたは {{LOGIN}} の代わりに、{{LOGIN}} にレビュー依頼が来た 1 件の Pull Request を下読みします。",
+        "rules": "",
+    },
+    ROLE_MANUAL: {
+        # レビュー依頼は来ていないが、本人が読みたくて頼んだ PR。書き方は依頼された PR と同じにする
+        "intro": "あなたは {{LOGIN}} の代わりに、{{LOGIN}} が個別に頼んだ 1 件の Pull Request を下読みします（{{LOGIN}} にレビュー依頼は来ていません）。",
         "rules": "",
     },
     ROLE_AUTHOR: {
@@ -752,12 +850,19 @@ def pr_status(rec: dict) -> str:
     sha = rec["head_sha"]
     reviews = rec.get("reviews", [])
     error = rec.get("last_error")
+    # 個別に頼んだ PR の新しい push は、自動ではレビューしない（ボタンで頼む）。
+    # ボタンでのレビューに失敗していても「次の回に再試行」にはならないので、この状態のまま出す（エラーはページがカードに出す）
+    outdated = role(rec) == ROLE_MANUAL and bool(reviews) and reviews[-1]["sha"] != sha
     if error and error.get("sha") == sha and (rerequest_pending(rec) or not (reviews and reviews[-1]["sha"] == sha)):
+        if outdated:
+            return "outdated"
         return "failed" if rec.get("attempts", {}).get(sha, 0) >= MAX_ATTEMPTS else "retrying"
     if rerequest_pending(rec):
         return "pending_rerequest"
     if reviews and reviews[-1]["sha"] == sha:
         return "reviewed"
+    if outdated:
+        return "outdated"
     return "pending_update" if reviews else "pending"
 
 
@@ -836,7 +941,7 @@ def redirect_output_to_log(path: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="レビュー依頼が来た PR と自分が作成した PR を Claude にレビューさせ、結果を HTML に出す")
+    parser = argparse.ArgumentParser(description="レビュー依頼が来た PR・自分が作成した PR・個別に頼んだ PR を Claude にレビューさせ、結果を HTML に出す")
     parser.add_argument("--force", action="store_true", help="曜日と時間帯（PR_REVIEW_DAYS / PR_REVIEW_HOURS）の判定を飛ばす")
     parser.add_argument("--dry-run", action="store_true", help="対象の PR を表示するだけで、レビューしない")
     parser.add_argument("--render-only", action="store_true", help="保存済みの結果から HTML だけ作り直す")
@@ -844,9 +949,21 @@ def main() -> int:
     parser.add_argument("--only", help="この PR だけレビューする（例: my-repo#123）")
     parser.add_argument("--again", action="store_true",
                         help="--only と一緒に使う。レビュー済みの PR や、失敗の上限に達した PR もレビューし直す（ページの「今すぐレビュー」）")
+    parser.add_argument("--add", metavar="PR",
+                        help="依頼が来ていない PR も、個別にレビューする（PR の URL か my-repo#123）。--only PR --again と同じように今すぐレビューする")
     parser.add_argument("--launchd", action="store_true",
                         help="launchd（と server.py）から起動したとき用。出力を日付ごとのログファイルに書く")
     args = parser.parse_args()
+    args.add_target = None
+    if args.add:
+        if args.only or args.dry_run or args.render_only:
+            # --dry-run でも記録は足されてしまい、次の定期実行でレビューされる。--render-only では何もしない
+            parser.error("--add は --only・--dry-run・--render-only と一緒に指定できません")
+        try:
+            args.add_target = parse_pr_ref(args.add)
+        except ValueError as e:
+            parser.error(str(e))
+        args.only, args.again = f"{args.add_target[0]}#{args.add_target[1]}", True
     if args.again and not args.only:
         parser.error("--again は --only と一緒に指定してください")
 
@@ -907,8 +1024,12 @@ def run_once(args: argparse.Namespace, started: str) -> int:
     try:
         login = my_login()
         teams = my_teams()
-        requested, mine = sync(login, teams)
+        requested, mine, manual = sync(login, teams)
         cleanup_qa_workdirs()
+        if args.add_target:
+            # 取り直したあとに足す。足した記録は正式なリポジトリ名で持つので、対象もその名前で探す
+            # （見つからない・オープン中でなければ足さないので、下で対象が見つからず EXIT_NOT_TARGET になる）
+            args.only = add_manual(*args.add_target) or args.only
         if args.only:
             # --again なら、レビュー済みの PR や、失敗の上限に達した PR もレビューし直す（ページの「今すぐレビュー」）
             pending = [(p, r) for p, r in all_records()
@@ -918,13 +1039,14 @@ def run_once(args: argparse.Namespace, started: str) -> int:
                 log(f"{args.only} はレビューの対象ではありません（依頼が外れた・クローズした・レビュー済みなど）")
         else:
             pending = [(p, r) for p, r in all_records() if needs_review(r)]
-        # 依頼された PR を先にレビューする（相手を待たせているため）。自分の PR はその後
+        # 依頼された PR を先にレビューする（相手を待たせているため）。自分の PR と個別に頼んだ PR はその後
         pending.sort(key=lambda pr: (role(pr[1]) != ROLE_REVIEWER, pr[1].get("first_seen_at", ""), pr[1]["number"]))
-        log(f"依頼中 {requested} 件 / {f'自分の PR {mine} 件' if MY_PRS else '自分の PR は対象外'} / レビュー待ち {len(pending)} 件")
+        log(f"依頼中 {requested} 件 / {f'自分の PR {mine} 件' if MY_PRS else '自分の PR は対象外'} / 個別 {manual} 件"
+            f" / レビュー待ち {len(pending)} 件")
 
         if args.dry_run:
             for _, rec in pending:
-                where = "自分の PR" if role(rec) == ROLE_AUTHOR else ", ".join(rec["requested_via"])
+                where = {ROLE_AUTHOR: "自分の PR", ROLE_MANUAL: "個別"}.get(role(rec)) or ", ".join(rec["requested_via"])
                 print(f"  {rec['repo']}#{rec['number']} {rec['head_sha'][:7]} {rec['title']} ({where})")
             render(login, teams)
             return 0
@@ -939,7 +1061,8 @@ def run_once(args: argparse.Namespace, started: str) -> int:
                 rec["attempts"] = {}
                 # 定期実行でもレビューする状態（レビュー待ち・再依頼・失敗）なら、定期実行と同じに扱う。
                 # 定期実行では飛ばす、レビュー済みの push をやり直すときだけ「レビューし直し」にする
-                rerun = not needs_review(rec)
+                # （個別に頼んだ PR の新しい push も定期実行では飛ばすが、push が違うのでレビューし直しではない）
+                rerun = not needs_review(rec) and any(r["sha"] == rec["head_sha"] for r in rec.get("reviews", []))
             if review_one(path, rec, login, rerun=rerun):
                 reviewed += 1
             else:

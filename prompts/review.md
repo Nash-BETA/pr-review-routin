@@ -8,7 +8,7 @@
 
 | パス | 内容 |
 |---|---|
-| `pr/meta.json` | タイトル・作成者・ベースブランチ・head の SHA・変更規模・レビュー依頼の経路・`role`（`reviewer` はレビュー依頼が来た PR、`author` は {{LOGIN}} が作成した PR） |
+| `pr/meta.json` | タイトル・作成者・ベースブランチ・head の SHA・変更規模・レビュー依頼の経路・`role`（`reviewer` はレビュー依頼が来た PR、`author` は {{LOGIN}} が作成した PR、`manual` は依頼は来ていないが {{LOGIN}} が個別に頼んだ PR） |
 | `pr/body.md` | PR の本文 |
 | `pr/commits.json` | コミットの一覧（メッセージ付き） |
 | `pr/files.json` | 変更ファイルの一覧 |

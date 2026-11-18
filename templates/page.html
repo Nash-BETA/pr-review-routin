@@ -116,6 +116,9 @@
   .st-failed { background: var(--must-bg); color: var(--must); border-color: transparent; }
   .st-inactive { color: var(--muted); }
   .st-running { background: var(--q-bg); color: var(--q); border-color: transparent; }
+  .st-outdated { background: var(--warn-bg); border-color: transparent; }
+  .runform { display: flex; gap: 6px; align-items: center; }
+  .runform input { font: inherit; font-size: 13px; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; width: 300px; max-width: 60vw; }
   .card-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
   .risk-high { background: var(--must-bg); color: var(--must); border-color: transparent; }
   .risk-medium { background: var(--imo-bg); color: var(--imo); border-color: transparent; }
@@ -155,6 +158,7 @@
   .suggestion .arrow { color: var(--accent); font-weight: 700; }
 
   .linkbtn { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; font-size: 12px; }
+  .linkbtn:disabled { opacity: .5; cursor: default; }
   .qa { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
   .qa-toggle { font-size: 13px; }
   .msg { margin: 8px 0; padding: 8px 12px; border-radius: 8px; }
@@ -273,18 +277,21 @@
     pending_rerequest: '再依頼（レビュー待ち）',
     retrying: '失敗（次の回に再試行）',
     failed: '失敗（再試行の上限）',
+    outdated: '新しい push あり（ボタンでレビュー）',
     inactive: '依頼が外れた',
   };
-  // 自分の PR の inactive は「依頼が外れた」ではなく、クローズ（マージ）されたもの
-  const statusLabel = (pr) => (pr.status === 'inactive' && roleOf(pr) === 'author' ? 'クローズ済み' : STATUS[pr.status] || pr.status);
-  // タブ。PR の role（reviewer / author）で分ける。role を持たない記録は、自分の PR を扱う前の版で作った依頼された PR
+  // 自分の PR・個別に頼んだ PR の inactive は「依頼が外れた」ではなく、クローズ（マージ）されたもの
+  const statusLabel = (pr) => (pr.status === 'inactive' && roleOf(pr) !== 'reviewer' ? 'クローズ済み' : STATUS[pr.status] || pr.status);
+  // タブ。PR の role（reviewer / author / manual）で分ける。role を持たない記録は、自分の PR を扱う前の版で作った依頼された PR
   const TABS = [
     { id: 'reviewer', label: 'レビュー依頼', activeLabel: '依頼中', showInactiveLabel: '依頼が外れた PR も表示', empty: 'まだレビュー依頼はありません。' },
     { id: 'author', label: '自分の PR', activeLabel: 'オープン中', showInactiveLabel: 'クローズした PR も表示', empty: 'オープン中の自分の PR はありません。' },
+    { id: 'manual', label: '個別レビュー', activeLabel: 'オープン中', showInactiveLabel: 'クローズした PR も表示', empty: 'URL を貼ってレビューした PR はありません。' },
   ];
   const roleOf = (pr) => pr.role || 'reviewer';
-  // 自分の PR のレビューを無効にしていて記録も無ければ、タブを出さない（以前と同じ見た目になる）
-  const visibleTabs = TABS.filter((t) => t.id === 'reviewer' || data.my_prs || data.prs.some((p) => roleOf(p) === t.id));
+  // 自分の PR のレビューを無効にしていて記録も無ければ、そのタブを出さない（以前と同じ見た目になる）。
+  // 個別レビューのタブは、URL を貼ってレビューした PR があるときだけ出す
+  const visibleTabs = TABS.filter((t) => t.id === 'reviewer' || (t.id === 'author' && data.my_prs) || data.prs.some((p) => roleOf(p) === t.id));
   const RISK = { high: 'リスク 高', medium: 'リスク 中', low: 'リスク 低' };
   const LEVELS = ['must', 'q', 'imo', 'nit'];
   const LEVEL_LABEL = { must: 'MUST', q: 'Q', imo: 'IMO', nit: 'NIT' };
@@ -481,18 +488,28 @@
   const EXIT = (qa && qa.exit_codes) || {};
   const myLast = () => (myPid !== null && run.last && run.last.pid === myPid ? run.last : null);
   const RETRY_TEXT = 'ほかの実行と重なったため、押した PR のレビューは行っていません。';
+  // URL を貼って、依頼が来ていない PR も個別にレビューする
+  const urlInput = h('input', {
+    type: 'text', placeholder: 'PR の URL を貼る', 'aria-label': 'PR の URL',
+    title: `${data.org || ''} の PR の URL（https://github.com/${data.org || '<org>'}/<リポジトリ>/pull/<番号>）か <リポジトリ>#<番号>`,
+  });
+  const urlForm = h('form', {
+    class: 'runform',
+    onsubmit: (e) => { e.preventDefault(); const url = urlInput.value.trim(); if (url) startRun(null, url); },
+  }, urlInput, h('button', { class: 'btn', type: 'submit', 'data-run-btn': '', title: 'レビュー依頼が来ていない PR も、今すぐレビューして「個別レビュー」のタブに出します' }, '個別にレビュー'));
   const runAllBtn = h('button', {
     class: 'btn', type: 'button',
-    title: 'レビュー依頼と自分の PR を今すぐ探し直し、レビュー待ちの PR をレビューします（曜日と時間帯の設定に関係なく動きます）',
+    title: 'レビュー依頼・自分の PR・個別に頼んだ PR を今すぐ取り直し、レビュー待ちの PR をレビューします（曜日と時間帯の設定に関係なく動きます）',
     onclick: () => startRun(null),
   }, '今すぐ実行');
   const runStatus = h('span', { class: 'run-status' });
   // 今レビューしている PR。分からなければ、ボタンで指定した PR（サーバーを再起動して target が消えていても only で分かる）
   const runningKey = () => (run.running ? (run.progress && (run.progress.current || run.progress.only)) || run.target : null);
-  const RUN_LABEL = { reviewed: 'レビューし直す', failed: 'もう一度試す' };
+  const RUN_LABEL = { reviewed: 'レビューし直す', failed: 'もう一度試す', outdated: '新しい push をレビュー' };
   const RUN_TITLE = {
     reviewed: 'この PR を今すぐレビューし直します（新しい push が無くても）',
     failed: '失敗の回数を数え直して、この PR を今すぐレビューします',
+    outdated: '新しい push を今すぐレビューします（個別レビューの PR は、push のたびに自動ではレビューしません）',
   };
   const hhmm = (iso) => {
     const d = new Date(iso);
@@ -529,7 +546,8 @@
     return res.json();
   }
 
-  async function startRun(pr) {
+  // pr を渡せばその PR だけ、url を渡せばその PR を（一覧に無ければ個別レビューとして足して）、どちらも無ければ全体を今すぐレビューする
+  async function startRun(pr, url = null) {
     if (!qa || run.running) return;
     runNote = null;
     myPid = null;
@@ -540,17 +558,22 @@
       const res = await fetch('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-PRR-Token': qa.token },
-        body: JSON.stringify(pr ? { repo: pr.repo, number: pr.number } : {}),
+        body: JSON.stringify(url ? { url } : pr ? { repo: pr.repo, number: pr.number } : {}),
       });
       const body = await res.json().catch(() => ({}));
       if (res.ok) {
         run = body.run;
         myPid = body.pid;
+        if (url) {
+          urlInput.value = '';
+          // 終わって読み直したときに、その PR が出るタブを開く（どのタブに入るかは取り直した結果で決まるので、PR を覚えておく）
+          store.set('prr:focus', run.target);
+        }
       } else if (res.status === 409 && body.run) {
         // 定期実行などの途中。終わるまでボタンを押せなくする。
         // PR を指定したときは依頼を受け付けていない（定期実行はレビュー済みの PR を飛ばす）ので、終わっても自動で読み直さず、もう一度押してもらう
         run = body.run;
-        runNote = { kind: 'info', text: body.message, retry: !!pr };
+        runNote = { kind: 'info', text: body.message, retry: !!(pr || url) };
       } else {
         throw new Error(body.message || `${res.status} ${res.statusText}`);
       }
@@ -603,7 +626,7 @@
       return;
     }
     if (mine && mine.exit_code === EXIT.not_target) {
-      runNote = { kind: 'info', reload: true, text: '押した PR は、取得し直したらレビューの対象から外れていました（依頼が外れた・クローズしたなど）。' };
+      runNote = { kind: 'info', reload: true, text: '押した PR はレビューの対象になりませんでした（見つからない・クローズ・マージ済み、依頼が外れたなど）。' };
       return;
     }
     if (mine && mine.exit_code !== 0) {
@@ -631,6 +654,38 @@
     }, RUN_LABEL[pr.status] || '今すぐレビュー');
   }
 
+  // 個別に頼んだ PR を一覧から外す。依頼された PR・自分の PR は GitHub の状態で決まるので、外すボタンは出さない
+  function removeButton(pr) {
+    if (!qa || roleOf(pr) !== 'manual') return null;
+    return h('button', {
+      // 質問に答えている途中は外せない（サーバーも断る）
+      class: 'linkbtn', type: 'button', 'data-run-btn': '', disabled: run.running || !!inflight[prKey(pr)],
+      title: '個別レビューの一覧から外します（レビュー結果と質問の会話も消えます）',
+      onclick: () => removePr(pr),
+    }, '一覧から外す');
+  }
+
+  async function removePr(pr) {
+    if (!window.confirm(`${prKey(pr)} を個別レビューの一覧から外しますか？\nレビュー結果と質問の会話も消えます。`)) return;
+    try {
+      const res = await fetch('/api/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-PRR-Token': qa.token },
+        body: JSON.stringify({ repo: pr.repo, number: pr.number }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.message || `${res.status} ${res.statusText}`);
+    } catch (e) {
+      runNote = { kind: 'error', text: `一覧から外せませんでした: ${e.message || e}` };
+      updateRunUi();
+      return;
+    }
+    // ページは読み直さずに、その PR だけを消す（書きかけの質問を消さないため）
+    data.prs = data.prs.filter((p) => prKey(p) !== prKey(pr));
+    setupFilters();
+    render();
+  }
+
   const MY_STATUS = ['not_fixed', 'partial', 'unclear', 'replied', 'fixed'];
   const MY_STATUS_LABEL = { not_fixed: '未対応', partial: '一部対応', unclear: '判断できない', replied: '返信で回答', fixed: '対応済み' };
 
@@ -646,15 +701,20 @@
   }
   if (qa) {
     const box = document.getElementById('runbox');
-    box.append(runStatus, runAllBtn);
+    box.append(runStatus, urlForm, runAllBtn);
     box.hidden = false;
   }
 
   // ---- タブ ----
-  // URL に ?tab=author（または ?tab=reviewer）を付けて開くと、そのタブを選ぶ。無ければ前回選んだタブ
+  // URL に ?tab=author（または ?tab=reviewer・?tab=manual）を付けて開くと、そのタブを選ぶ。無ければ前回選んだタブ。
+  // URL を貼ってレビューした直後は、その PR が入ったタブを開く（リポジトリ名の大文字小文字は区別しない）
+  const focusKey = String(store.get('prr:focus', '') || '').toLowerCase();
+  store.set('prr:focus', null);
+  const focused = focusKey && data.prs.find((p) => prKey(p).toLowerCase() === focusKey);
   const params = new URLSearchParams(location.search);
   const tabIds = visibleTabs.map((t) => t.id);
-  let tab = [params.get('tab'), store.get('prr:tab', 'reviewer')].find((id) => tabIds.includes(id)) || 'reviewer';
+  let tab = [focused && roleOf(focused), params.get('tab'), store.get('prr:tab', 'reviewer')].find((id) => tabIds.includes(id)) || 'reviewer';
+  if (focused) store.set('prr:tab', tab);
   const currentTab = () => TABS.find((t) => t.id === tab);
   const inTab = (pr) => roleOf(pr) === tab;
   const unconfirmed = (prs) => prs.filter((p) => p.status === 'reviewed' && !isConfirmed(p));
@@ -811,13 +871,14 @@
           pr.draft ? h('span', { class: 'badge', text: 'draft' }) : null,
           pr.rerequest_count > 0 ? h('span', { class: 'badge rereq', text: `再依頼 ${fmt(pr.requested_at)}` }) : null,
           (pr.requested_via || []).map((v) => h('span', { class: 'badge via', text: v === '自分' ? '自分宛て' : `チーム: ${v}` })),
-          roleOf(pr) === 'reviewer' ? h('span', { text: `作成者 ${pr.author}` }) : null,
+          roleOf(pr) !== 'author' ? h('span', { text: `作成者 ${pr.author}` }) : null,
           h('span', { text: `→ ${pr.base}` }),
           h('span', { text: `+${pr.additions} / −${pr.deletions}（${pr.changed_files} ファイル）` }),
         )),
       h('div', { class: 'card-side' },
         pr.latest ? h('label', { class: 'confirm' }, checkbox, '確認済み') : null,
-        runButton(pr)),
+        runButton(pr),
+        removeButton(pr)),
     );
 
     const parts = [head];
@@ -827,11 +888,14 @@
     } else if (err && pr.status === 'reviewed' && err.sha === pr.latest.sha && new Date(err.at) > new Date(pr.latest.reviewed_at)) {
       // レビュー済みの push をボタンでレビューし直して失敗した。自動ではやり直さない
       parts.push(h('div', { class: 'error', text: `${fmt(err.at)} レビューし直しに失敗しました（表示は前の結果です）: ${err.message}` }));
+    } else if (err && pr.status === 'outdated' && err.sha === pr.head_sha) {
+      // 個別に頼んだ PR の新しい push を、ボタンでレビューして失敗した。自動ではやり直さない
+      parts.push(h('div', { class: 'error', text: `${fmt(err.at)} 新しい push のレビューに失敗しました（表示は前の push の結果です）: ${err.message}` }));
     }
     if (pr.latest) {
       const details = h('details', {},
         h('summary', {}, 'レビュー結果', levelCounts(pr.latest),
-          pr.status === 'pending_update' ? h('span', { class: 'sub', text: '（古い push に対する結果です）' }) : null,
+          ['pending_update', 'outdated'].includes(pr.status) ? h('span', { class: 'sub', text: '（古い push に対する結果です）' }) : null,
           pr.status === 'pending_rerequest' ? h('span', { class: 'sub', text: '（再依頼前の結果です）' }) : null),
         reviewBody(pr, pr.latest),
         (pr.older || []).length ? h('details', { class: 'older' },
