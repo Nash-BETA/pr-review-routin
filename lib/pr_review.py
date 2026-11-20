@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import traceback
 from pathlib import Path
 
 
@@ -535,7 +536,9 @@ def fetch_my_comments(repo: str, number: int, login: str, author: str) -> dict |
         paginate=True,
         params={"per_page": "100"},
     )
-    my_reviews = [r for r in reviews if (r.get("user") or "").lower() == me]
+    # 下書き中のレビュー（PENDING。submitted_at が null）は、まだ PR に出していないので数えない。
+    # GitHub は下書きを書いた本人にだけ返すので、自分の gh で取ると混ざる
+    my_reviews = [r for r in reviews if (r.get("user") or "").lower() == me and r.get("submitted_at")]
 
     comments = gh_json_lines(
         f"repos/{ORG}/{repo}/pulls/{number}/comments",
@@ -561,7 +564,7 @@ def fetch_my_comments(repo: str, number: int, login: str, author: str) -> dict |
     if not my_reviews and not threads:
         return None
 
-    first_at = min([r["submitted_at"] for r in my_reviews if r.get("submitted_at")] + [t["created_at"] for t in threads])
+    first_at = min([r["submitted_at"] for r in my_reviews] + [t["created_at"] for t in threads])
     issue_comments = gh_json_lines(
         f"repos/{ORG}/{repo}/issues/{number}/comments",
         '.[] | {user: .user.login, body, created_at} | @json',
@@ -804,7 +807,10 @@ def review_one(path: Path, rec: dict, login: str, *, rerun: bool = False) -> boo
         diff_lines = prepare_workdir(work, rec, login, rerun=rerun)
         mode = "summary" if diff_lines > LARGE_DIFF_LINES else "full"
         result, stats = run_claude(work, build_prompt(mode, diff_lines, login, role(rec)))
-    except (StepError, OSError, tarfile.TarError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+    except Exception as e:  # noqa: BLE001 — 1 件の失敗で、残りの PR のレビューを止めない
+        if not isinstance(e, (StepError, OSError, tarfile.TarError, subprocess.SubprocessError, json.JSONDecodeError)):
+            # 想定外の例外は、起きた場所が分からないと直せないので traceback ごと残す
+            log(f"想定外のエラー: {repo}#{number}\n{traceback.format_exc()}")
         attempts = rec.setdefault("attempts", {})
         attempts[sha] = attempts.get(sha, 0) + 1
         rec["last_error"] = {"sha": sha, "at": now_iso(), "message": str(e)[:1000], "attempts": attempts[sha]}

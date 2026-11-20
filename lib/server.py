@@ -30,7 +30,10 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
+import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -474,13 +477,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 connected = False
 
+        try:
+            self.reply(rec, question, emit)
+        except Exception as e:  # noqa: BLE001 — ヘッダーを送った後なので、何が起きてもページに理由を返す
+            # 想定外の例外は、起きた場所が分からないと直せないので traceback ごと残す
+            m.log(f"回答中に想定外のエラー: {rec['repo']}#{rec['number']}\n{traceback.format_exc()}")
+            emit({"type": "error", "message": f"答えられませんでした（想定外のエラー）: {type(e).__name__}: {e}"})
+
+    def reply(self, rec: dict, question: str, emit: Callable[[dict], None]) -> None:
+        """質問に答える（answer の本体）。途中経過と結果は emit でページに送る。"""
         repo, number, sha = rec["repo"], rec["number"], rec["head_sha"]
         m.log(f"質問: {repo}#{number} ({sha[:7]}) {question[:80]!r}")
         with _concurrency:
             try:
                 emit({"type": "status", "text": "PR のファイルを準備しています"})
                 work = prepare_qa_workdir(rec)
-            except (m.StepError, OSError, subprocess.SubprocessError) as e:
+            except (m.StepError, OSError, tarfile.TarError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+                # 想定外の例外は answer で traceback ごとログに残す
+                m.log(f"質問の準備に失敗: {repo}#{number}: {e}")
                 emit({"type": "error", "message": f"PR のファイルを準備できませんでした: {e}"})
                 return
 
